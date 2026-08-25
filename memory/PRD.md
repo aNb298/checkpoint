@@ -25,6 +25,10 @@ Checkpoint helps freelancers and small creative/service agencies manage client a
 - **Client Email Notifications** — via Emergent-managed email proxy. Auto-sent when: (1) engagement created with a client email, (2) a milestone is cleared and the next checkpoint becomes ready. Dark-branded HTML templates with portal CTA button. Fire-and-forget (`asyncio.create_task`), guarded by the `_assert_safe_email` gate.
 - **Change Request Thread** — a change request opens a per-milestone thread (`change_thread[]`, `change_status: open|resolved`). Client posts from the portal (public endpoint), agency replies from its view (authed endpoint) and can Mark Resolved.
 - **Stripe Payments** — cleared milestones show a real "Pay" button in the client portal. Backend creates a Stripe hosted checkout session (amount = fee + expense, server-side) via `emergentintegrations` StripeCheckout. Payment confirmed by polling `GET /api/public/payments/{session_id}/status` (+ webhook `/api/webhook/stripe`); milestone `payment_status` → `paid` idempotently via `payment_transactions` collection.
+- **Payment Reminders** — hourly background sweep (`payment_reminder_loop`) emails the client a friendly nudge when a payment request sits unpaid for `REMINDER_DAYS` (default 3, env-tunable) days; re-nudges every 3 days via `payment_reminder_at` stamp on the milestone.
+- **Earnings Overview** — dashboard totals panel (testID `earnings-panel`): Cleared / Awaiting / Paid amounts computed client-side across all engagements.
+- **Deliverable Attachments** — agency attaches preview links or uploads files (≤15 MB, Emergent Object Storage) per milestone; clients open them from the portal via `GET /api/public/engagements/{token}/attachments/{att_id}` (files streamed through backend, links 307-redirect). `storage_path` kept in DB only, never in API responses.
+- **Thread Alerts** — agency user is emailed when a client opens a change request or replies on a thread.
 
 ## Backend Endpoints (FastAPI, prefix `/api`)
 - `POST /auth/session` — exchange Emergent OAuth session_id → app session_token
@@ -41,10 +45,14 @@ Checkpoint helps freelancers and small creative/service agencies manage client a
 - `POST /public/engagements/{token}/milestones/{ms_id}/pay` — create Stripe checkout, returns `{url, session_id}`
 - `GET  /public/payments/{session_id}/status` — poll payment; marks paid when Stripe confirms
 - `POST /webhook/stripe` — Stripe webhook backup path
+- `POST /engagements/{eng_id}/milestones/{ms_id}/attachments` — agency adds link `{name, url}` (authed)
+- `POST /engagements/{eng_id}/milestones/{ms_id}/attachments/upload` — agency uploads file (multipart, authed)
+- `DELETE /engagements/{eng_id}/milestones/{ms_id}/attachments/{att_id}` — agency removes attachment (authed)
+- `GET  /public/engagements/{token}/attachments/{att_id}` — client opens file (streamed) or link (redirect)
 
 ## Data Model
 `engagements`: `{engagement_id, agency_user_id, client_name, client_email?, share_token, status, scope_accepted_at?, created_at, milestones[]}`
-`milestones[]`: `{milestone_id, title, fee, expense, status, payment_status(not_requested|requested|paid), change_request?, change_status?(open|resolved), change_thread[]: {message_id, author(client|agency), author_name?, body, created_at}, payment_session_id?, paid_at?, cleared_by_name?, cleared_by_email?, cleared_at?}`
+`milestones[]`: `{milestone_id, title, fee, expense, status, payment_status(not_requested|requested|paid), change_request?, change_status?(open|resolved), change_thread[]: {message_id, author(client|agency), author_name?, body, created_at}, attachments[]: {attachment_id, kind(file|link), name, url?, content_type?, storage_path?(DB-only), created_at}, payment_session_id?, paid_at?, payment_reminder_at?, cleared_by_name?, cleared_by_email?, cleared_at?}`
 `payment_transactions`: `{session_id, engagement_id, milestone_id, share_token, amount, currency, payment_status(initiated|paid), created_at, paid_at?}`
 `user_sessions`: TTL by `expires_at`
 
@@ -52,3 +60,4 @@ Checkpoint helps freelancers and small creative/service agencies manage client a
 - **Emergent-managed Google Sign-In** — no keys required.
 - **Emergent-managed Email (Resend proxy)** — `EMERGENT_EMAIL_KEY` + `EMAIL_FROM_NAME=Checkpoint` in backend/.env. Sender address fixed by platform.
 - **Stripe (test)** — `STRIPE_API_KEY=sk_test_emergent` in backend/.env via `emergentintegrations` StripeCheckout. `APP_BASE_URL` in backend/.env is the preview origin used for checkout redirect + email links (must be updated on fork).
+- **Emergent Object Storage** — `EMERGENT_LLM_KEY` in backend/.env; init at startup; files at `checkpoint/uploads/{user_id}/{uuid}.{ext}`.

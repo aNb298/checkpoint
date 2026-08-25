@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Header, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Request, UploadFile, File, Response
+from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -35,6 +36,44 @@ EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY", "")
 EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "Checkpoint")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "")
+REMINDER_DAYS = float(os.environ.get("REMINDER_DAYS", "3"))
+
+# ---- Emergent managed object storage ----
+STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+_storage_key = None
+
+async def init_storage():
+    global _storage_key
+    if _storage_key:
+        return _storage_key
+    async with httpx.AsyncClient(timeout=30) as http:
+        resp = await http.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY})
+    resp.raise_for_status()
+    _storage_key = resp.json()["storage_key"]
+    return _storage_key
+
+async def _storage_request(method: str, path: str, **kwargs):
+    global _storage_key
+    key = await init_storage()
+    async with httpx.AsyncClient(timeout=120) as http:
+        resp = await http.request(method, f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, **kwargs.pop("headers", {})}, **kwargs)
+    if resp.status_code == 503:  # stale storage key — re-init once
+        _storage_key = None
+        key = await init_storage()
+        async with httpx.AsyncClient(timeout=120) as http:
+            resp = await http.request(method, f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, **kwargs.pop("headers", {})}, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+async def put_object(path: str, data: bytes, content_type: str) -> dict:
+    resp = await _storage_request("PUT", path, headers={"Content-Type": content_type}, content=data)
+    return resp.json()
+
+async def get_object(path: str):
+    resp = await _storage_request("GET", path)
+    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
 # ---- Email guardrail gate (G2/G3 structural checks) ----
 _SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
@@ -125,6 +164,10 @@ def _portal_button(token: str, label: str) -> str:
     return (f'<p style="margin:26px 0 0"><a href="{APP_BASE_URL}/{token}" style="background:#9B6CFF;color:#F6F4F8;text-decoration:none;'
             f'padding:14px 26px;border-radius:8px;font-size:14px;font-weight:bold;display:inline-block">{escape(label)}</a></p>')
 
+def _app_button(label: str) -> str:
+    return (f'<p style="margin:26px 0 0"><a href="{APP_BASE_URL}/" style="background:#9B6CFF;color:#F6F4F8;text-decoration:none;'
+            f'padding:14px 26px;border-radius:8px;font-size:14px;font-weight:bold;display:inline-block">{escape(label)}</a></p>')
+
 async def send_engagement_created_email(doc: dict):
     total = sum(float(m.get("fee") or 0) + float(m.get("expense") or 0) for m in doc.get("milestones", []))
     count = len(doc.get("milestones", []))
@@ -146,6 +189,64 @@ async def send_checkpoint_ready_email(doc: dict, milestone: dict, position: int)
         + _portal_button(doc["share_token"], "Open your client portal")
     )
     await _deliver_email(doc["client_email"], f'Checkpoint ready for review: {milestone["title"]}', _email_shell(inner))
+
+async def send_payment_reminder_email(doc: dict, milestone: dict):
+    amount = float(milestone.get("fee") or 0) + float(milestone.get("expense") or 0)
+    inner = (
+        f'<h2 style="color:#F6F4F8;font-size:22px;margin:0">A quick nudge on your milestone payment.</h2>'
+        f'<p style="color:#C2B8D5;font-size:14px;line-height:22px;margin:16px 0 0"><strong style="color:#F6F4F8">{escape(milestone["title"])}</strong> '
+        f'was cleared on your engagement and its payment request of <strong style="color:#F6F4F8">${amount:,.0f}</strong> is still open. '
+        f'You can settle it in one tap from your portal whenever you are ready.</p>'
+        + _portal_button(doc["share_token"], "Open portal & pay")
+    )
+    await _deliver_email(doc["client_email"], f'Friendly reminder: payment open for {milestone["title"]}', _email_shell(inner))
+
+async def send_thread_alert_email(agency_email: str, doc: dict, milestone: dict, headline: str, note: str):
+    inner = (
+        f'<h2 style="color:#F6F4F8;font-size:22px;margin:0">{escape(headline)}</h2>'
+        f'<p style="color:#C2B8D5;font-size:14px;line-height:22px;margin:16px 0 0">On <strong style="color:#F6F4F8">{escape(doc.get("client_name") or "an engagement")}</strong> '
+        f'· checkpoint <strong style="color:#F6F4F8">{escape(milestone["title"])}</strong>:</p>'
+        f'<p style="color:#F6F4F8;font-size:14px;line-height:22px;margin:14px 0 0;padding:12px 16px;background:#2A2338;border-left:3px solid #9B6CFF;border-radius:6px">{escape(note)}</p>'
+        + _app_button("Open Checkpoint to reply")
+    )
+    await _deliver_email(agency_email, f'Change request update · {doc.get("client_name") or "Engagement"}', _email_shell(inner))
+
+async def notify_agency_thread(doc: dict, milestone: dict, headline: str, note: str):
+    agency = await db.users.find_one({"user_id": doc.get("agency_user_id")}, {"_id": 0})
+    if agency and agency.get("email"):
+        asyncio.create_task(send_thread_alert_email(agency["email"], doc, milestone, headline, note))
+
+# ---- Payment reminder sweep ----
+async def run_payment_reminders():
+    cutoff = datetime.now(timezone.utc) - timedelta(days=REMINDER_DAYS)
+    cursor = db.engagements.find({"client_email": {"$nin": [None, ""]}, "status": "active"}, {"_id": 0})
+    async for doc in cursor:
+        changed = False
+        for m in doc["milestones"]:
+            if m.get("status") == "cleared" and m.get("payment_status") == "requested":
+                last = m.get("payment_reminder_at") or m.get("cleared_at")
+                if not last:
+                    continue
+                try:
+                    last_dt = datetime.fromisoformat(last)
+                except ValueError:
+                    continue
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                if last_dt < cutoff:
+                    m["payment_reminder_at"] = datetime.now(timezone.utc).isoformat()
+                    changed = True
+                    asyncio.create_task(send_payment_reminder_email(doc, dict(m)))
+        if changed:
+            await db.engagements.update_one({"engagement_id": doc["engagement_id"]}, {"$set": {"milestones": doc["milestones"]}})
+
+async def payment_reminder_loop():
+    while True:
+        try:
+            await run_payment_reminders()
+        except Exception as e:
+            logger.error(f"Payment reminder sweep failed: {e}")
+        await asyncio.sleep(3600)
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -170,6 +271,18 @@ class ThreadMessage(BaseModel):
     body: str
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+class Attachment(BaseModel):
+    attachment_id: str = Field(default_factory=lambda: f"att_{uuid.uuid4().hex[:10]}")
+    kind: str  # "file" | "link"
+    name: str
+    url: Optional[str] = None  # links only
+    content_type: Optional[str] = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+class AttachmentLinkCreate(BaseModel):
+    name: str
+    url: str
+
 class ThreadMessageCreate(BaseModel):
     body: str
     author_name: Optional[str] = None
@@ -186,6 +299,8 @@ class Milestone(BaseModel):
     change_thread: List[ThreadMessage] = Field(default_factory=list)
     payment_session_id: Optional[str] = None
     paid_at: Optional[str] = None
+    payment_reminder_at: Optional[str] = None
+    attachments: List[Attachment] = Field(default_factory=list)
     cleared_by_name: Optional[str] = None
     cleared_by_email: Optional[str] = None
     cleared_at: Optional[str] = None
@@ -353,6 +468,7 @@ async def request_change(token: str, milestone_id: str, payload: ChangeRequest):
             milestone["change_status"] = "open"
             milestone.setdefault("change_thread", [])
             milestone["change_thread"].append(ThreadMessage(author="client", author_name=payload.author_name or doc.get("client_name"), body=payload.note).model_dump())
+            await notify_agency_thread(doc, milestone, "New change request from your client.", payload.note)
             break
     else:
         raise HTTPException(status_code=404, detail="Milestone not found")
@@ -381,6 +497,7 @@ async def client_change_message(token: str, milestone_id: str, payload: ThreadMe
     milestone["change_thread"].append(ThreadMessage(author="client", author_name=payload.author_name or doc.get("client_name"), body=payload.body.strip()).model_dump())
     milestone["change_status"] = "open"
     await db.engagements.update_one({"share_token": token}, {"$set": {"milestones": doc["milestones"]}})
+    await notify_agency_thread(doc, milestone, "New reply on a change request thread.", payload.body.strip())
     return Engagement(**clean_engagement(doc))
 
 @api_router.post("/engagements/{engagement_id}/milestones/{milestone_id}/change-messages", response_model=Engagement)
@@ -475,6 +592,76 @@ async def stripe_webhook(request: Request):
         await _mark_paid(event.session_id)
     return {"received": True}
 
+# ---- Deliverable attachments ----
+@api_router.post("/engagements/{engagement_id}/milestones/{milestone_id}/attachments", response_model=Engagement)
+async def add_link_attachment(engagement_id: str, milestone_id: str, payload: AttachmentLinkCreate, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    if not payload.name.strip() or not payload.url.strip().lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="A label and a valid http(s) URL are required")
+    doc = await get_agency_engagement(engagement_id, user)
+    milestone = _find_milestone(doc, milestone_id)
+    milestone.setdefault("attachments", [])
+    milestone["attachments"].append(Attachment(kind="link", name=payload.name.strip(), url=payload.url.strip()).model_dump())
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.post("/engagements/{engagement_id}/milestones/{milestone_id}/attachments/upload", response_model=Engagement)
+async def upload_file_attachment(engagement_id: str, milestone_id: str, file: UploadFile = File(...), authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    doc = await get_agency_engagement(engagement_id, user)
+    milestone = _find_milestone(doc, milestone_id)
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 15 MB)")
+    filename = file.filename or "file"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    storage_path = f"checkpoint/uploads/{user['user_id']}/{uuid.uuid4().hex}.{ext}"
+    content_type = file.content_type or "application/octet-stream"
+    try:
+        await put_object(storage_path, data, content_type)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 402:
+            raise HTTPException(status_code=402, detail="Storage quota exceeded — uploads temporarily unavailable")
+        logger.error(f"Storage upload failed: {e}")
+        raise HTTPException(status_code=502, detail="File upload failed")
+    att = Attachment(kind="file", name=filename, content_type=content_type).model_dump()
+    att["storage_path"] = storage_path  # persisted in DB only; response model drops it
+    milestone.setdefault("attachments", [])
+    milestone["attachments"].append(att)
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.delete("/engagements/{engagement_id}/milestones/{milestone_id}/attachments/{attachment_id}", response_model=Engagement)
+async def remove_attachment(engagement_id: str, milestone_id: str, attachment_id: str, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    doc = await get_agency_engagement(engagement_id, user)
+    milestone = _find_milestone(doc, milestone_id)
+    before = len(milestone.get("attachments", []))
+    milestone["attachments"] = [a for a in milestone.get("attachments", []) if a["attachment_id"] != attachment_id]
+    if len(milestone["attachments"]) == before:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.get("/public/engagements/{token}/attachments/{attachment_id}")
+async def download_attachment(token: str, attachment_id: str):
+    doc = await get_engagement(token)
+    for m in doc["milestones"]:
+        for a in m.get("attachments", []):
+            if a["attachment_id"] == attachment_id:
+                if a.get("kind") == "link" and a.get("url"):
+                    return RedirectResponse(a["url"])
+                try:
+                    data, ctype = await get_object(a["storage_path"])
+                except Exception as e:
+                    logger.error(f"Storage read failed for {attachment_id}: {e}")
+                    raise HTTPException(status_code=404, detail="File unavailable")
+                safe_name = (a.get("name") or "file").replace('"', "")
+                return Response(content=data, media_type=ctype, headers={"Content-Disposition": f'inline; filename="{safe_name}"'})
+    raise HTTPException(status_code=404, detail="Attachment not found")
+
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
     status_dict = input.dict()
@@ -511,6 +698,11 @@ async def shutdown_db_client():
 
 @app.on_event("startup")
 async def ensure_indexes_and_sample():
+    try:
+        await init_storage()
+    except Exception as e:
+        logger.error(f"Storage init failed: {e}")
+    asyncio.create_task(payment_reminder_loop())
     await db.users.create_index("email", unique=True)
     await db.users.create_index("user_id", unique=True)
     await db.user_sessions.create_index("session_token", unique=True)

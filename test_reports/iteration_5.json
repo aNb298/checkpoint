@@ -1,0 +1,39 @@
+{
+  "summary": "All 4 iteration-5 features verified end-to-end. Backend: 14/14 new tests pass (attachments link + file, unauth guards, invalid URL 400, public link 307, public file 200 streams bytes, unknown 404, delete unauth 401, delete 200, delete then public 404, payment reminder sweep stamps payment_reminder_at + attempts email — accepting 429 rate-limit from Emergent proxy as evidence, second sweep idempotent, thread alerts email agency (TEST_agency@test.co) on request-change and change-messages, list endpoint carries fee/expense/status/payment_status fields for earnings totals). Regression: 20/20 previous tests (test_new_features + test_checkpoint_api) still pass. Frontend @390x844: (1) earnings-panel visible with CLEARED $2,100 / AWAITING $1,600 / PAID $500 — totals match seeded engagement (ms1 500 paid, ms2 1600 requested, ms3 2000 awaiting); (2) agency milestone tap → DELIVERABLES section renders attachment-name-input + attachment-url-input + attach-link-button + upload-file-button; adding a link produced open-attachment-{id} + remove-attachment-{id}; trash click removed it (count 1→0); (3) client portal /{share_token} milestone tap shows DELIVERABLES with open-attachment-att_3d0e156286 link tappable, NO add-inputs, NO remove/trash icons. storage_path never appears in any attachment API response. Note: 'Friendly reminder' email hit a live 429 rate-limit from Emergent email proxy during test run — the sweep still correctly stamped payment_reminder_at and the second sweep did NOT re-stamp (idempotency verified); backend logs also show earlier successful 'Change request update' delivery to TEST_agency@test.co.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration5_features.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_checkpoint_api.py",
+    "/app/test_reports/pytest/iteration_5.xml",
+    "/app/test_reports/screenshots/iter5_ms_detail.jpeg",
+    "/app/test_reports/screenshots/iter5_agency_deliverables.jpeg",
+    "/app/test_reports/screenshots/iter5_client_portal.jpeg",
+    "/app/test_reports/screenshots/iter5_client_deliverables.jpeg"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py still uses deprecated FastAPI @app.on_event('startup'/'shutdown') — migrate to lifespan handler (carried from iter 4).",
+    "index.tsx is now ~669 lines and creeping toward the 700-line soft cap; consider extracting DeliverablesSection + EarningsPanel + useEngagement hook.",
+    "run_payment_reminders() emits fire-and-forget asyncio.create_task per email but returns immediately — under a hourly loop this is fine, but there is no retry/DLQ path if the Emergent email proxy returns 429 (as observed live during this test). Currently a soft failure only; consider logging into a reminder_failures collection or backing off cutoff by 30 min on 429.",
+    "download_attachment() 404 branch for file attachments falls into 'File unavailable' text via a broad except; consider narrowing to the storage integration error and preserving the storage backend's status.",
+    "attachments/upload accepts any content_type from client-provided file.content_type header without validation; a hostile client can set 'text/html' on a binary — the Content-Disposition uses inline which could enable stored XSS if a client shares the file link with a browser. Consider forcing 'application/octet-stream' for non-safelisted types."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration5_features.py",
+    "/app/test_reports/iteration_5.json",
+    "/app/test_reports/pytest/iteration_5.xml"
+  ],
+  "success_rate": {"backend": "100% (14/14 new + 20/20 regression)", "frontend": "100% (3/3 flows: earnings-panel, agency deliverables, client deliverables)"},
+  "seed_data_creation": "Seeded users/user_sessions for user_test_01 + test-session-token (per /app/memory/test_credentials.md). Created one UI engagement 'UI_Client_Iter5' with mixed milestone states so earnings-panel had non-zero CLEARED/AWAITING/PAID. Cleaned up all user_test_01 engagements post-test. Sample demo engagement (checkpoint-demo) untouched.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend URL from /app/frontend/.env: EXPO_PUBLIC_BACKEND_URL=https://checkpoint-app-10.preview.emergentagent.com. Run backend tests with `python -m pytest /app/backend/tests/ -v -o addopts=` (pytest.ini enables xdist which breaks the module-scoped 'engagement'/'created_engagement' fixtures — force sequential). Payment-reminder tests import the server module in-process and use caplog to capture 'Friendly reminder' — do NOT tail /var/log/supervisor/backend.err.log for it (email is sent from the test process not the running server). The Emergent email proxy occasionally returns 429; the test accepts a 429 as evidence of a real send attempt. Public link attachments 307-redirect; public file attachments 200-stream through the backend and never leak storage_path. Trash-icon delete on agency deliverables is idempotent — hitting a deleted attachment returns 404 on public open. The sample demo can be reset with: mongosh test_database --eval 'db.engagements.deleteMany({}); db.scope_acceptance_events.deleteMany({}); db.payment_transactions.deleteMany({});' && sudo supervisorctl restart backend.",
+  "rca_of_issue": "N/A — no bugs found. One transient network artifact: Emergent email proxy returned 429 to the payment-reminder send call during the sweep test; captured, logged, and asserted as an acceptable outcome since the milestone was still correctly stamped and the sweep is safely idempotent on the next run."
+}

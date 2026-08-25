@@ -4,6 +4,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as WebBrowser from "expo-web-browser";
 import * as SecureStore from "expo-secure-store";
 import * as Clipboard from "expo-clipboard";
+import * as DocumentPicker from "expo-document-picker";
 import Constants from "expo-constants";
 
 WebBrowser.maybeCompleteAuthSession();
@@ -11,7 +12,8 @@ const API = `${Constants.expoConfig?.extra?.backendUrl || process.env.EXPO_PUBLI
 const APP_ORIGIN = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 const colors = { bg: "#17151D", panel: "#221E2B", surface: "#F6F4F8", ink: "#17131D", muted: "#9A93A6", purple: "#9B6CFF", line: "#393244", green: "#55C49A", amber: "#DDAA62" };
 type ThreadMsg = { message_id: string; author: string; author_name?: string | null; body: string; created_at: string };
-type Milestone = { milestone_id: string; title: string; fee: number; expense: number; status: string; payment_status: string; change_request?: string | null; change_status?: string | null; change_thread?: ThreadMsg[]; payment_session_id?: string | null; paid_at?: string | null; cleared_by_name?: string | null; cleared_by_email?: string | null; cleared_at?: string | null };
+type Attachment = { attachment_id: string; kind: string; name: string; url?: string | null; content_type?: string | null; created_at: string };
+type Milestone = { milestone_id: string; title: string; fee: number; expense: number; status: string; payment_status: string; change_request?: string | null; change_status?: string | null; change_thread?: ThreadMsg[]; attachments?: Attachment[]; payment_session_id?: string | null; paid_at?: string | null; payment_reminder_at?: string | null; cleared_by_name?: string | null; cleared_by_email?: string | null; cleared_at?: string | null };
 type Engagement = { engagement_id: string; client_name: string; client_email?: string; share_token: string; status: string; scope_accepted_at?: string | null; milestones: Milestone[] };
 type Screen = "welcome" | "dashboard" | "create" | "share" | "agency" | "client" | "accept";
 
@@ -55,6 +57,9 @@ export default function Index() {
   const [threadMsg, setThreadMsg] = useState("");
   const [paying, setPaying] = useState(false);
   const [payBanner, setPayBanner] = useState<"" | "checking" | "paid" | "pending">("");
+  const [attName, setAttName] = useState("");
+  const [attUrl, setAttUrl] = useState("");
+  const [uploading, setUploading] = useState(false);
 
   // New engagement draft
   const [draftName, setDraftName] = useState("");
@@ -131,6 +136,15 @@ export default function Index() {
   })(); }, []);
 
   const cleared = useMemo(() => engagement?.milestones.filter(m => m.status === "cleared").length || 0, [engagement]);
+  const totals = useMemo(() => engagements.reduce((acc, e) => {
+    e.milestones.forEach(m => {
+      const amt = m.fee + (m.expense || 0);
+      if (m.status === "cleared") acc.cleared += amt;
+      if (m.payment_status === "requested") acc.invoiced += amt;
+      if (m.payment_status === "paid") acc.paid += amt;
+    });
+    return acc;
+  }, { cleared: 0, invoiced: 0, paid: 0 }), [engagements]);
 
   const accept = async () => {
     if (!engagement) return;
@@ -227,6 +241,57 @@ export default function Index() {
     setLoading(false);
   };
 
+  const addLinkAttachment = async (m: Milestone) => {
+    if (!engagement || !attName.trim() || !attUrl.trim()) { Alert.alert("Missing details", "Add a label and a URL."); return; }
+    const t = await getToken();
+    if (!t) return;
+    setLoading(true);
+    const url = attUrl.trim().toLowerCase().startsWith("http") ? attUrl.trim() : `https://${attUrl.trim()}`;
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}/attachments`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: attName.trim(), url }) });
+    if (r.ok) { syncEngagement(await r.json(), m.milestone_id); setAttName(""); setAttUrl(""); }
+    else { const d = await r.json().catch(() => ({})); Alert.alert("Could not attach", d.detail || "Please try again."); }
+    setLoading(false);
+  };
+
+  const uploadAttachment = async (m: Milestone) => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    const picked = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true });
+    if (picked.canceled || !picked.assets?.length) return;
+    const asset = picked.assets[0];
+    setUploading(true);
+    try {
+      const form = new FormData();
+      if (Platform.OS === "web") {
+        const blob = await (await fetch(asset.uri)).blob();
+        form.append("file", blob, asset.name);
+      } else {
+        form.append("file", { uri: asset.uri, name: asset.name, type: asset.mimeType || "application/octet-stream" } as any);
+      }
+      const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}/attachments/upload`, { method: "POST", headers: { Authorization: `Bearer ${t}` }, body: form });
+      if (r.ok) syncEngagement(await r.json(), m.milestone_id);
+      else { const d = await r.json().catch(() => ({})); Alert.alert("Upload failed", d.detail || "Please try again."); }
+    } catch { Alert.alert("Upload failed", "Please try again."); }
+    setUploading(false);
+  };
+
+  const removeAttachment = async (m: Milestone, attId: string) => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}/attachments/${attId}`, { method: "DELETE", headers: { Authorization: `Bearer ${t}` } });
+    if (r.ok) syncEngagement(await r.json(), m.milestone_id);
+  };
+
+  const openAttachment = async (a: Attachment) => {
+    if (!engagement) return;
+    const url = a.kind === "link" ? (a.url || "") : `${API}/public/engagements/${engagement.share_token}/attachments/${a.attachment_id}`;
+    if (!url) return;
+    if (Platform.OS === "web") window.open(url, "_blank");
+    else await WebBrowser.openBrowserAsync(url);
+  };
+
   const addDraftMilestone = () => {
     const fee = parseFloat(msFee || "0");
     if (!msTitle.trim() || isNaN(fee) || fee <= 0) { Alert.alert("Missing details", "Every checkpoint needs a description and a fee."); return; }
@@ -285,6 +350,13 @@ export default function Index() {
         <View><Text style={styles.sectionLabel}>ACTIVE ENGAGEMENTS</Text><Text style={styles.bigStat}>{engagements.length} <Text style={styles.bigStatMuted}>total</Text></Text></View>
         <Pressable onPress={() => setScreen("create")} testID="new-engagement-button" style={styles.newButton}><Ionicons name="add" size={18} color={colors.surface} /><Text style={styles.primaryText}>New engagement</Text></Pressable>
       </View>
+      {engagements.length > 0 && <View style={styles.earningsPanel} testID="earnings-panel">
+        <View style={styles.earningsCol}><Text style={styles.earningsLabel}>CLEARED</Text><Text style={styles.earningsValue}>{money(totals.cleared)}</Text></View>
+        <View style={styles.earningsDivider} />
+        <View style={styles.earningsCol}><Text style={styles.earningsLabel}>AWAITING</Text><Text style={[styles.earningsValue, { color: colors.amber }]}>{money(totals.invoiced)}</Text></View>
+        <View style={styles.earningsDivider} />
+        <View style={styles.earningsCol}><Text style={styles.earningsLabel}>PAID</Text><Text style={[styles.earningsValue, { color: colors.green }]}>{money(totals.paid)}</Text></View>
+      </View>}
       {engagements.length === 0 ? <View style={styles.emptyPanel}>
         <Ionicons name="navigate-outline" size={28} color={colors.muted} />
         <Text style={styles.emptyTitle}>No engagements yet</Text>
@@ -416,6 +488,23 @@ export default function Index() {
         {active.status === "cleared" && active.cleared_by_name ? <Text style={styles.clearedByLineDark}>Cleared by {active.cleared_by_name}{active.cleared_at ? `, ${formatDate(active.cleared_at)}` : ""}</Text> : null}
         <View style={styles.paymentLine}><Text style={styles.paymentLabel}>Milestone fee</Text><Text style={styles.paymentAmount}>{money(active.fee)}</Text></View>
         {active.expense > 0 && <View style={styles.paymentLineInner}><Text style={styles.paymentLabel}>Expense</Text><Text style={styles.paymentAmountSm}>{money(active.expense)}</Text></View>}
+        {(((active.attachments?.length || 0) > 0) || !isClient) && <View style={styles.attachBox}>
+          <Text style={[styles.subKicker, { marginTop: 0 }]}>DELIVERABLES</Text>
+          {(active.attachments || []).map(a => <View key={a.attachment_id} style={styles.attachRow}>
+            <Ionicons name={a.kind === "link" ? "link-outline" : "document-attach-outline"} size={16} color={colors.purple} />
+            <Pressable onPress={() => openAttachment(a)} style={{ flex: 1, minHeight: 30, justifyContent: "center" }} testID={`open-attachment-${a.attachment_id}`}><Text style={styles.attachName} numberOfLines={1}>{a.name}</Text></Pressable>
+            {!isClient && <Pressable onPress={() => removeAttachment(active, a.attachment_id)} testID={`remove-attachment-${a.attachment_id}`} style={styles.close}><Ionicons name="trash-outline" size={16} color="#8A8194" /></Pressable>}
+          </View>)}
+          {(active.attachments?.length || 0) === 0 && <Text style={styles.attachEmpty}>No deliverables attached yet — add a preview link or upload a file for your client.</Text>}
+          {!isClient && <>
+            <TextInput placeholder="Label (e.g. Final cut v2)" placeholderTextColor="#9A93A6" value={attName} onChangeText={setAttName} testID="attachment-name-input" style={styles.input} />
+            <TextInput placeholder="https://preview-link.com" placeholderTextColor="#9A93A6" value={attUrl} onChangeText={setAttUrl} autoCapitalize="none" keyboardType="url" testID="attachment-url-input" style={styles.input} />
+            <View style={[styles.rowGap, { marginTop: 14 }]}>
+              <Pressable onPress={() => addLinkAttachment(active)} disabled={loading} testID="attach-link-button" style={[styles.changeButton, { flex: 1 }]}><Text style={styles.changeText}>Attach link</Text></Pressable>
+              <Pressable onPress={() => uploadAttachment(active)} disabled={uploading} testID="upload-file-button" style={[styles.changeButton, { flex: 1 }]}>{uploading ? <ActivityIndicator color={colors.ink} /> : <Text style={styles.changeText}>Upload file</Text>}</Pressable>
+            </View>
+          </>}
+        </View>}
         {active.status !== "cleared" && isClient && engagement.status === "active" && <>
           <Text style={styles.subKicker}>YOUR NAME & EMAIL (FOR THE RECORD)</Text>
           <TextInput placeholder="Your name" placeholderTextColor="#9A93A6" value={clearName} onChangeText={setClearName} testID="clear-name-input" style={styles.input} />
@@ -549,6 +638,15 @@ const styles = StyleSheet.create({
   threadBody: { color: colors.ink, fontSize: 13, marginTop: 4, lineHeight: 19 },
   emailNote: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 12 },
   emailNoteText: { color: "#4C8A70", fontSize: 12, fontWeight: "600", flex: 1 },
+  earningsPanel: { flexDirection: "row", backgroundColor: colors.panel, borderRadius: 12, paddingVertical: 18, paddingHorizontal: 8, marginBottom: 6, alignItems: "center" },
+  earningsCol: { flex: 1, alignItems: "center", gap: 5 },
+  earningsLabel: { color: colors.muted, fontSize: 9, fontWeight: "800", letterSpacing: 1.2 },
+  earningsValue: { color: colors.surface, fontSize: 19, fontWeight: "800" },
+  earningsDivider: { width: 1, height: 34, backgroundColor: colors.line },
+  attachBox: { marginTop: 18, borderTopWidth: 1, borderTopColor: "#DDD7E1", paddingTop: 16 },
+  attachRow: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#EEEBF1", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, marginTop: 10 },
+  attachName: { color: colors.purple, fontSize: 13, fontWeight: "700" },
+  attachEmpty: { color: "#8A8194", fontSize: 12, marginTop: 10, lineHeight: 17 },
   emptyPanel: { backgroundColor: colors.panel, borderRadius: 12, padding: 32, alignItems: "center", marginTop: 12 },
   emptyTitle: { color: colors.surface, fontSize: 17, fontWeight: "700", marginTop: 14 },
   emptyBody: { color: colors.muted, fontSize: 13, textAlign: "center", marginTop: 8, lineHeight: 19, maxWidth: 320 },
