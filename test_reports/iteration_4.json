@@ -1,0 +1,42 @@
+{
+  "summary": "All 20 backend tests passed (11 new + 9 regression). Frontend flows verified end-to-end at 390x844: (1) client portal payment — ms_02 shows 'Payment request · $1,920' and pay-milestone-button navigates to https://checkout.stripe.com/c/pay/cs_test_... ; (2) payment redirect banner — visiting /checkpoint-demo?session_id=<unpaid> shows 'Confirming your payment with Stripe…' then falls back to 'Payment not confirmed yet — it can take a moment.' with URL cleaned back to /checkpoint-demo; (3) change-request thread — client can open thread with OPEN pill + Change requested inline, reply via thread-message-input + thread-send-button; (4) agency dashboard shows '1 open change' in engagement-card meta line when a change_status=open exists; (5) agency thread reply appends 'Test Agency · AGENCY · will fix by EOD', 'Mark resolved' flips pill to RESOLVED (green). Email dispatch confirmed via backend logs — 202 Accepted from integrations.emergentagent.com with subjects 'Your project plan is ready to review on Checkpoint' and 'Checkpoint ready for review: TEST_Delivery'. Regressions (accept scope, sequential clear, share link, dashboard list, create engagement) all pass.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_checkpoint_api.py",
+    "/app/test_reports/pytest/iteration_4.xml",
+    "/app/test_reports/screenshots/iter4_client_portal.jpeg",
+    "/app/test_reports/screenshots/iter4_ms2_detail.jpeg",
+    "/app/test_reports/screenshots/iter4_stripe_checkout.jpeg",
+    "/app/test_reports/screenshots/iter4_change_thread.jpeg",
+    "/app/test_reports/screenshots/iter4_thread_reply.jpeg",
+    "/app/test_reports/screenshots/iter4_banner.jpeg",
+    "/app/test_reports/screenshots/iter4_banner_final.jpeg",
+    "/app/test_reports/screenshots/iter4_dashboard.jpeg",
+    "/app/test_reports/screenshots/iter4_agency_thread.jpeg",
+    "/app/test_reports/screenshots/iter4_resolved.jpeg"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py still uses deprecated FastAPI @app.on_event('startup'/'shutdown'); consider migrating to lifespan handler (non-blocking, previously noted).",
+    "index.tsx is a single 571-line screen. Consider splitting into per-screen components + a small useEngagement hook — file is at the 700-line soft cap and screens re-render together on any state change.",
+    "The client polling in pollPayment() gives up after ~16s with 'Payment not confirmed yet' — for slow Stripe test confirmations the client would need to refresh the page manually. Consider extending or backing off (non-blocking; UX only).",
+    "app/[token].tsx delegates to Index which reads window.location.pathname; this is unconventional for expo-router but works on web. Not tested on native (out of scope for web preview)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/test_reports/iteration_4.json"
+  ],
+  "success_rate": {"backend": "100% (20/20)", "frontend": "100% (5/5 flows)"},
+  "seed_data_creation": "Seeded users/user_sessions for user_test_01 + test-session-token (per /app/memory/test_credentials.md). Created 1 UI-only engagement 'UI_Test_Client' under user_test_01 with an open change on ms1 for the agency dashboard '1 open change' check. All UI-created data cleaned up post-test (dropped user_test_01 engagements, reset ms_03 change_thread on the sample demo).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend URL: EXPO_PUBLIC_BACKEND_URL from /app/frontend/.env. Run backend tests with `python -m pytest /app/backend/tests/ -v -o addopts=` (the pytest.ini enables xdist which breaks the module-scoped created_engagement fixture in test_new_features.py — force sequential). Email verification is via /var/log/supervisor/backend.err.log tailing for 'Email sent to delivered@resend.dev'. Stripe payments create real cs_test_* checkout sessions via emergentintegrations; test card 4242 4242 4242 4242 works but wasn't completed end-to-end in this run (the banner-fallback path was exercised instead). The sample demo engagement can be reset with: mongosh test_database --eval 'db.engagements.deleteMany({}); db.scope_acceptance_events.deleteMany({}); db.payment_transactions.deleteMany({});' && sudo supervisorctl restart backend.",
+  "rca_of_issue": "N/A — no bugs found. One transient pytest-xdist ordering issue was seen (Stripe test ran on gw1 before the clear test on gw0 populated the fixture); resolved by running without xdist. This is a test-runner concern only, not a code bug."
+}

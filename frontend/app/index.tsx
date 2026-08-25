@@ -10,7 +10,8 @@ WebBrowser.maybeCompleteAuthSession();
 const API = `${Constants.expoConfig?.extra?.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 const APP_ORIGIN = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 const colors = { bg: "#17151D", panel: "#221E2B", surface: "#F6F4F8", ink: "#17131D", muted: "#9A93A6", purple: "#9B6CFF", line: "#393244", green: "#55C49A", amber: "#DDAA62" };
-type Milestone = { milestone_id: string; title: string; fee: number; expense: number; status: string; payment_status: string; change_request?: string | null; cleared_by_name?: string | null; cleared_by_email?: string | null; cleared_at?: string | null };
+type ThreadMsg = { message_id: string; author: string; author_name?: string | null; body: string; created_at: string };
+type Milestone = { milestone_id: string; title: string; fee: number; expense: number; status: string; payment_status: string; change_request?: string | null; change_status?: string | null; change_thread?: ThreadMsg[]; payment_session_id?: string | null; paid_at?: string | null; cleared_by_name?: string | null; cleared_by_email?: string | null; cleared_at?: string | null };
 type Engagement = { engagement_id: string; client_name: string; client_email?: string; share_token: string; status: string; scope_accepted_at?: string | null; milestones: Milestone[] };
 type Screen = "welcome" | "dashboard" | "create" | "share" | "agency" | "client" | "accept";
 
@@ -27,7 +28,8 @@ function Path({ milestones, onSelect, showClearedBy }: { milestones: Milestone[]
       <Text style={styles.milestoneTitle}>{m.title}</Text>
       <Text style={styles.milestoneMeta}>{money(m.fee)} fee {m.expense ? ` · ${money(m.expense)} expense` : ""}</Text>
       {showClearedBy && m.status === "cleared" && m.cleared_by_name ? <Text style={styles.clearedByLine}>Cleared by {m.cleared_by_name}{m.cleared_at ? `, ${formatDate(m.cleared_at)}` : ""}</Text> : null}
-      {m.change_request ? <Text style={styles.changeRequestLine}>Change requested: {m.change_request}</Text> : null}
+      {m.change_status === "open" && m.change_request ? <Text style={styles.changeRequestLine}>Change requested: {m.change_request}</Text> : null}
+      {m.payment_status === "paid" ? <Text style={styles.clearedByLine}>Paid{m.paid_at ? ` ${formatDate(m.paid_at)}` : ""} · Stripe</Text> : null}
     </View>
     <View style={[styles.statusDot, m.status === "cleared" && { backgroundColor: colors.green }]} />
   </Pressable>)}</View>;
@@ -50,6 +52,9 @@ export default function Index() {
   const [clearName, setClearName] = useState("");
   const [clearEmail, setClearEmail] = useState("");
   const [sessionChecked, setSessionChecked] = useState(false);
+  const [threadMsg, setThreadMsg] = useState("");
+  const [paying, setPaying] = useState(false);
+  const [payBanner, setPayBanner] = useState<"" | "checking" | "paid" | "pending">("");
 
   // New engagement draft
   const [draftName, setDraftName] = useState("");
@@ -106,7 +111,16 @@ export default function Index() {
     }
     if (pathToken && pathToken !== "api" && pathToken !== "index.html") {
       const publicResponse = await fetch(`${API}/public/engagements/${pathToken}`);
-      if (publicResponse.ok) { setEngagement(await publicResponse.json()); setScreen("client"); setSessionChecked(true); return; }
+      if (publicResponse.ok) {
+        setEngagement(await publicResponse.json());
+        setScreen("client");
+        setSessionChecked(true);
+        if (Platform.OS === "web") {
+          const sid = new URLSearchParams(window.location.search).get("session_id");
+          if (sid) { window.history.replaceState({}, "", `/${pathToken}`); pollPayment(sid, pathToken); }
+        }
+        return;
+      }
     }
     const t = await getToken();
     if (t) {
@@ -137,8 +151,79 @@ export default function Index() {
   const requestChange = async (m: Milestone) => {
     if (!engagement || !changeNote.trim()) return;
     setLoading(true);
-    const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/request-change`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: changeNote.trim() }) });
-    if (r.ok) { setEngagement(await r.json()); setChangeNote(""); setActive(null); }
+    const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/request-change`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: changeNote.trim(), author_name: clearName.trim() || undefined }) });
+    if (r.ok) { syncEngagement(await r.json(), m.milestone_id); setChangeNote(""); }
+    setLoading(false);
+  };
+
+  const syncEngagement = (data: Engagement, milestoneId: string) => {
+    setEngagement(data);
+    setActive(data.milestones.find(x => x.milestone_id === milestoneId) || null);
+  };
+
+  const pollPayment = async (sessionId: string, token: string) => {
+    setPayBanner("checking");
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        const r = await fetch(`${API}/public/payments/${sessionId}/status`);
+        if (r.ok) {
+          const d = await r.json();
+          if (d.payment_status === "paid") {
+            const er = await fetch(`${API}/public/engagements/${token}`);
+            if (er.ok) {
+              const data: Engagement = await er.json();
+              setEngagement(data);
+              setActive(prev => prev ? data.milestones.find(x => x.milestone_id === prev.milestone_id) || null : null);
+            }
+            setPayBanner("paid");
+            return;
+          }
+          if (d.status === "expired") break;
+        }
+      } catch {}
+      await new Promise(res => setTimeout(res, 2000));
+    }
+    setPayBanner("pending");
+  };
+
+  const payMilestone = async (m: Milestone) => {
+    if (!engagement) return;
+    setPaying(true);
+    try {
+      const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/pay`, { method: "POST" });
+      const d = await r.json();
+      if (r.ok && d.url) {
+        if (Platform.OS === "web") { window.location.assign(d.url); return; }
+        await WebBrowser.openBrowserAsync(d.url);
+        await pollPayment(d.session_id, engagement.share_token);
+      } else {
+        Alert.alert("Payment unavailable", d.detail || "Please try again.");
+      }
+    } catch { Alert.alert("Payment unavailable", "Please try again."); }
+    setPaying(false);
+  };
+
+  const sendThreadMessage = async (m: Milestone) => {
+    if (!engagement || !threadMsg.trim()) return;
+    setLoading(true);
+    let r: Response | null = null;
+    if (screen === "client") {
+      r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/change-messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: threadMsg.trim(), author_name: clearName.trim() || undefined }) });
+    } else {
+      const t = await getToken();
+      if (t) r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}/change-messages`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` }, body: JSON.stringify({ body: threadMsg.trim() }) });
+    }
+    if (r?.ok) { syncEngagement(await r.json(), m.milestone_id); setThreadMsg(""); }
+    setLoading(false);
+  };
+
+  const resolveChange = async (m: Milestone) => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    setLoading(true);
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}/resolve-change`, { method: "POST", headers: { Authorization: `Bearer ${t}` } });
+    if (r.ok) syncEngagement(await r.json(), m.milestone_id);
     setLoading(false);
   };
 
@@ -208,6 +293,7 @@ export default function Index() {
         const clearedCount = e.milestones.filter(m => m.status === "cleared").length;
         const paidCount = e.milestones.filter(m => m.payment_status === "paid").length;
         const requestedCount = e.milestones.filter(m => m.payment_status === "requested").length;
+        const openChanges = e.milestones.filter(m => m.change_status === "open").length;
         return <Pressable key={e.engagement_id} onPress={() => openEngagement(e)} testID={`engagement-card-${e.engagement_id}`} style={({ pressed }) => [styles.engagementCard, pressed && styles.pressed]}>
           <View style={styles.rowBetween}>
             <View style={{ flex: 1 }}>
@@ -218,7 +304,7 @@ export default function Index() {
           </View>
           <View style={styles.progressBar}><View style={[styles.progressFill, { width: `${(clearedCount / e.milestones.length) * 100}%` }]} /></View>
           <View style={styles.rowBetween}>
-            <Text style={styles.engagementMeta}>{paidCount} paid · {requestedCount} awaiting payment</Text>
+            <Text style={styles.engagementMeta}>{paidCount} paid · {requestedCount} awaiting payment{openChanges > 0 ? ` · ${openChanges} open change${openChanges > 1 ? "s" : ""}` : ""}</Text>
             <Text style={styles.engagementLink}>/{e.share_token.slice(0, 12)}…</Text>
           </View>
         </Pressable>;
@@ -272,6 +358,7 @@ export default function Index() {
         <Text style={styles.cardKicker}>ENGAGEMENT CREATED</Text>
         <Text style={styles.cardTitle}>Share this link with your client.</Text>
         <Text style={styles.bodyDark}>{`They'll review the trajectory and accept the full plan before any checkpoint moves.`}</Text>
+        {engagement.client_email ? <View style={styles.emailNote}><Ionicons name="mail-outline" size={15} color="#4C8A70" /><Text style={styles.emailNoteText}>We emailed {engagement.client_email} this link automatically.</Text></View> : null}
         <View style={styles.linkBox}>
           <Ionicons name="link-outline" size={18} color={colors.purple} />
           <Text style={styles.linkText} numberOfLines={1} testID="share-link-text">{shareUrl}</Text>
@@ -312,6 +399,10 @@ export default function Index() {
         <View><Text style={styles.sectionLabel}>{isClient ? "ENGAGEMENT STATUS" : "ACTIVE ENGAGEMENT"}</Text><Text style={styles.bigStat}>{cleared} <Text style={styles.bigStatMuted}>/ {engagement.milestones.length}</Text></Text><Text style={styles.statCaption}>checkpoints cleared</Text></View>
         <View style={styles.statusPill}><View style={[styles.pillDot, engagement.status !== "active" && { backgroundColor: colors.amber }]} /><Text style={styles.pillText}>{engagement.status === "active" ? "ACTIVE" : "AWAITING SCOPE"}</Text></View>
       </View>
+      {payBanner !== "" && <View style={[styles.payBanner, payBanner === "paid" && styles.payBannerPaid]}>
+        {payBanner === "checking" ? <ActivityIndicator size="small" color={colors.purple} /> : <Ionicons name={payBanner === "paid" ? "checkmark-circle" : "time-outline"} size={18} color={payBanner === "paid" ? colors.green : colors.amber} />}
+        <Text style={styles.payBannerText} testID="payment-banner-text">{payBanner === "checking" ? "Confirming your payment with Stripe…" : payBanner === "paid" ? "Payment received — thank you!" : "Payment not confirmed yet — it can take a moment. Check back shortly."}</Text>
+      </View>}
       {isClient && engagement.status !== "active" && <Pressable onPress={() => setScreen("accept")} testID="open-accept-button" style={styles.notice}><Ionicons name="lock-open-outline" size={19} color={colors.purple} /><View style={{ flex: 1 }}><Text style={styles.noticeTitle}>Scope acceptance required</Text><Text style={styles.noticeBody}>Accept the plan before the first milestone can move.</Text></View><Ionicons name="chevron-forward" size={18} color={colors.purple} /></Pressable>}
       {!isClient && <View style={styles.linkBoxDark}><Ionicons name="link-outline" size={16} color={colors.purple} /><Text style={styles.linkTextDark} numberOfLines={1} testID="agency-share-link">{shareUrl}</Text><Pressable onPress={copyShareLink} testID="agency-copy-link" style={styles.smallCopy}><Ionicons name="copy-outline" size={15} color={colors.purple} /></Pressable></View>}
       <View style={styles.sectionHead}><Text style={styles.sectionTitle}>Trajectory</Text><Text style={styles.sectionHint}>{isClient ? "Tap a checkpoint to review" : "Shared with client"}</Text></View>
@@ -319,9 +410,9 @@ export default function Index() {
       {active && <View style={styles.lightCard}>
         <View style={styles.rowBetween}>
           <View><Text style={styles.cardKicker}>CHECKPOINT {engagement.milestones.indexOf(active) + 1}</Text><Text style={styles.cardTitle}>{active.title}</Text></View>
-          <Pressable onPress={() => { setActive(null); setChangeNote(""); setClearName(""); setClearEmail(""); }} testID="close-milestone-button" style={styles.close}><Ionicons name="close" size={19} color={colors.ink} /></Pressable>
+          <Pressable onPress={() => { setActive(null); setChangeNote(""); setClearName(""); setClearEmail(""); setThreadMsg(""); }} testID="close-milestone-button" style={styles.close}><Ionicons name="close" size={19} color={colors.ink} /></Pressable>
         </View>
-        <Text style={styles.bodyDark}>{active.status === "cleared" ? "This checkpoint is cleared. A payment request has been generated for the milestone amount." : "Review the deliverable, then clear it or request changes before work proceeds."}</Text>
+        <Text style={styles.bodyDark}>{active.status === "cleared" ? (active.payment_status === "paid" ? "This checkpoint is cleared and the milestone payment has been received." : "This checkpoint is cleared. A payment request has been generated for the milestone amount.") : "Review the deliverable, then clear it or request changes before work proceeds."}</Text>
         {active.status === "cleared" && active.cleared_by_name ? <Text style={styles.clearedByLineDark}>Cleared by {active.cleared_by_name}{active.cleared_at ? `, ${formatDate(active.cleared_at)}` : ""}</Text> : null}
         <View style={styles.paymentLine}><Text style={styles.paymentLabel}>Milestone fee</Text><Text style={styles.paymentAmount}>{money(active.fee)}</Text></View>
         {active.expense > 0 && <View style={styles.paymentLineInner}><Text style={styles.paymentLabel}>Expense</Text><Text style={styles.paymentAmountSm}>{money(active.expense)}</Text></View>}
@@ -336,11 +427,29 @@ export default function Index() {
           </View>
         </>}
         {active.status === "cleared" && <View style={styles.paymentRequest}>
-          <Ionicons name="link-outline" size={18} color={colors.purple} />
+          <Ionicons name={active.payment_status === "paid" ? "checkmark-circle" : "card-outline"} size={18} color={active.payment_status === "paid" ? colors.green : colors.purple} />
           <View style={{ flex: 1 }}>
-            <Text style={styles.paymentRequestText}>Payment request · {money(active.fee)}</Text>
-            <Text style={styles.paymentRequestSub}>Placeholder link — connects to a real payment gateway in production.</Text>
+            <Text style={[styles.paymentRequestText, active.payment_status === "paid" && { color: colors.green }]} testID="payment-status-text">{active.payment_status === "paid" ? `Paid · ${money(active.fee + (active.expense || 0))}` : `Payment request · ${money(active.fee + (active.expense || 0))}`}</Text>
+            <Text style={styles.paymentRequestSub}>{active.payment_status === "paid" ? `Received via Stripe${active.paid_at ? ` · ${formatDate(active.paid_at)}` : ""}.` : isClient ? "Pay securely in one tap with Stripe — card or wallet." : "Stripe payment link is live — your client can pay from their portal."}</Text>
+            {active.payment_status !== "paid" && isClient && <Pressable onPress={() => payMilestone(active)} disabled={paying} testID="pay-milestone-button" style={styles.payButton}>{paying ? <ActivityIndicator color={colors.surface} /> : <><Ionicons name="lock-closed" size={15} color={colors.surface} /><Text style={styles.primaryText}>Pay {money(active.fee + (active.expense || 0))}</Text></>}</Pressable>}
           </View>
+        </View>}
+        {((active.change_thread?.length || 0) > 0) && <View style={styles.threadBox}>
+          <View style={styles.rowBetween}>
+            <Text style={[styles.subKicker, { marginTop: 0 }]}>CHANGE REQUEST THREAD</Text>
+            <View style={[styles.threadPill, active.change_status === "resolved" && styles.threadPillResolved]}><Text style={[styles.threadPillText, active.change_status === "resolved" && { color: colors.green }]} testID="thread-status-pill">{active.change_status === "resolved" ? "RESOLVED" : "OPEN"}</Text></View>
+          </View>
+          {(active.change_thread || []).map(msg => <View key={msg.message_id} style={[styles.threadMsg, msg.author === "agency" && styles.threadMsgAgency]}>
+            <Text style={styles.threadAuthor}>{msg.author === "agency" ? `${msg.author_name || "Agency"} · AGENCY` : msg.author_name || "Client"} · {formatDate(msg.created_at)}</Text>
+            <Text style={styles.threadBody}>{msg.body}</Text>
+          </View>)}
+          {active.change_status !== "resolved" && <>
+            <TextInput placeholder={isClient ? "Reply to the agency…" : "Reply to your client…"} placeholderTextColor="#9A93A6" value={threadMsg} onChangeText={setThreadMsg} testID="thread-message-input" style={styles.input} />
+            <View style={[styles.actionRow, { marginTop: 4 }]}>
+              <Pressable onPress={() => sendThreadMessage(active)} disabled={loading} testID="thread-send-button" style={styles.darkButton}>{loading ? <ActivityIndicator color={colors.surface} /> : <Text style={styles.primaryText}>Send reply</Text>}</Pressable>
+              {!isClient && <Pressable onPress={() => resolveChange(active)} testID="resolve-change-button" style={styles.changeButton}><Text style={styles.changeText}>Mark resolved</Text></Pressable>}
+            </View>
+          </>}
         </View>}
       </View>}
     </ScrollView>
@@ -426,6 +535,20 @@ const styles = StyleSheet.create({
   paymentRequestText: { color: colors.purple, fontSize: 13, fontWeight: "700" },
   paymentRequestSub: { color: "#8A8194", fontSize: 11, marginTop: 3, lineHeight: 15 },
   clearedByLineDark: { color: colors.green, fontSize: 12, marginTop: 8, fontWeight: "600" },
+  payButton: { backgroundColor: colors.purple, minHeight: 46, borderRadius: 8, marginTop: 14, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, paddingHorizontal: 18, alignSelf: "flex-start" },
+  payBanner: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: colors.panel, borderRadius: 10, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: colors.line },
+  payBannerPaid: { borderColor: colors.green },
+  payBannerText: { color: colors.surface, fontSize: 13, flex: 1, fontWeight: "600" },
+  threadBox: { marginTop: 18, borderTopWidth: 1, borderTopColor: "#DDD7E1", paddingTop: 16 },
+  threadPill: { borderWidth: 1, borderColor: colors.amber, borderRadius: 12, paddingHorizontal: 8, paddingVertical: 3 },
+  threadPillResolved: { borderColor: colors.green },
+  threadPillText: { color: colors.amber, fontSize: 9, fontWeight: "800", letterSpacing: 1 },
+  threadMsg: { backgroundColor: "#EEEBF1", borderRadius: 10, padding: 12, marginTop: 10 },
+  threadMsgAgency: { backgroundColor: "#E9E1F7" },
+  threadAuthor: { color: "#8A8194", fontSize: 10, fontWeight: "700", letterSpacing: 0.4 },
+  threadBody: { color: colors.ink, fontSize: 13, marginTop: 4, lineHeight: 19 },
+  emailNote: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 12 },
+  emailNoteText: { color: "#4C8A70", fontSize: 12, fontWeight: "600", flex: 1 },
   emptyPanel: { backgroundColor: colors.panel, borderRadius: 12, padding: 32, alignItems: "center", marginTop: 12 },
   emptyTitle: { color: colors.surface, fontSize: 17, fontWeight: "700", marginTop: 14 },
   emptyBody: { color: colors.muted, fontSize: 13, textAlign: "center", marginTop: 8, lineHeight: 19, maxWidth: 320 },
