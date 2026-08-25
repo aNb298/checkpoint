@@ -44,6 +44,9 @@ class Milestone(BaseModel):
     status: str = "awaiting_clearance"
     payment_status: str = "not_requested"
     change_request: Optional[str] = None
+    cleared_by_name: Optional[str] = None
+    cleared_by_email: Optional[str] = None
+    cleared_at: Optional[str] = None
 
 class EngagementCreate(BaseModel):
     client_name: str
@@ -66,6 +69,10 @@ class ScopeAcceptance(BaseModel):
 
 class ChangeRequest(BaseModel):
     note: str
+
+class ClearMilestone(BaseModel):
+    client_name: Optional[str] = None
+    client_email: Optional[str] = None
 
 class User(BaseModel):
     user_id: str
@@ -162,17 +169,23 @@ async def accept_scope(token: str, payload: ScopeAcceptance):
     return Engagement(**clean_engagement(doc))
 
 @api_router.post("/public/engagements/{token}/milestones/{milestone_id}/clear", response_model=Engagement)
-async def clear_milestone(token: str, milestone_id: str):
+async def clear_milestone(token: str, milestone_id: str, payload: ClearMilestone):
     doc = await get_engagement(token)
     if doc.get("status") != "active":
         raise HTTPException(status_code=409, detail="Scope must be accepted first")
     changed = False
+    cleared_at = datetime.now(timezone.utc).isoformat()
+    fallback_name = doc.get("client_name") or "Client"
+    fallback_email = doc.get("client_email")
     for index, milestone in enumerate(doc["milestones"]):
         if milestone["milestone_id"] == milestone_id:
             if index > 0 and doc["milestones"][index - 1]["status"] != "cleared":
                 raise HTTPException(status_code=409, detail="Clear the previous checkpoint first")
             milestone["status"] = "cleared"
             milestone["payment_status"] = "requested"
+            milestone["cleared_by_name"] = (payload.client_name or "").strip() or fallback_name
+            milestone["cleared_by_email"] = (payload.client_email or "").strip() or fallback_email
+            milestone["cleared_at"] = cleared_at
             changed = True
             break
     if not changed:
@@ -233,8 +246,17 @@ async def ensure_indexes_and_sample():
     await db.user_sessions.create_index("session_token", unique=True)
     await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
     if await db.engagements.count_documents({}) == 0:
-        sample = {"engagement_id": "eng_sample_01", "agency_user_id": "sample_agency", "client_name": "Northstar Studio", "client_email": "hello@northstar.example", "share_token": "checkpoint-demo", "status": "active", "scope_accepted_at": "2025-02-14T10:30:00+00:00", "created_at": "2025-02-10T09:00:00+00:00", "milestones": [{"milestone_id": "ms_01", "title": "Creative direction", "fee": 900, "expense": 0, "status": "cleared", "payment_status": "paid", "change_request": None}, {"milestone_id": "ms_02", "title": "First cut delivery", "fee": 1800, "expense": 120, "status": "cleared", "payment_status": "requested", "change_request": None}, {"milestone_id": "ms_03", "title": "Revision round", "fee": 1100, "expense": 0, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}, {"milestone_id": "ms_04", "title": "Final masters", "fee": 700, "expense": 80, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}, {"milestone_id": "ms_05", "title": "Launch handoff", "fee": 500, "expense": 0, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}, {"milestone_id": "ms_06", "title": "Archive & closeout", "fee": 300, "expense": 0, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}]}
+        sample = {"engagement_id": "eng_sample_01", "agency_user_id": "sample_agency", "client_name": "Northstar Studio", "client_email": "hello@northstar.example", "share_token": "checkpoint-demo", "status": "active", "scope_accepted_at": "2025-02-14T10:30:00+00:00", "created_at": "2025-02-10T09:00:00+00:00", "milestones": [{"milestone_id": "ms_01", "title": "Creative direction", "fee": 900, "expense": 0, "status": "cleared", "payment_status": "paid", "change_request": None, "cleared_by_name": "Ava Chen", "cleared_by_email": "ava@northstar.example", "cleared_at": "2025-02-16T14:12:00+00:00"}, {"milestone_id": "ms_02", "title": "First cut delivery", "fee": 1800, "expense": 120, "status": "cleared", "payment_status": "requested", "change_request": None, "cleared_by_name": "Ava Chen", "cleared_by_email": "ava@northstar.example", "cleared_at": "2025-02-22T09:04:00+00:00"}, {"milestone_id": "ms_03", "title": "Revision round", "fee": 1100, "expense": 0, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}, {"milestone_id": "ms_04", "title": "Final masters", "fee": 700, "expense": 80, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}, {"milestone_id": "ms_05", "title": "Launch handoff", "fee": 500, "expense": 0, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}, {"milestone_id": "ms_06", "title": "Archive & closeout", "fee": 300, "expense": 0, "status": "awaiting_clearance", "payment_status": "not_requested", "change_request": None}]}
         await db.engagements.insert_one(sample)
         await db.scope_acceptance_events.insert_one({"audit_id": "audit_sample_01", "engagement_id": "eng_sample_01", "share_token": "checkpoint-demo", "client_name": "Northstar Studio", "client_email": "hello@northstar.example", "accepted_at": "2025-02-14T10:30:00+00:00"})
     elif not await db.scope_acceptance_events.find_one({"engagement_id": "eng_sample_01"}, {"_id": 0}):
         await db.scope_acceptance_events.insert_one({"audit_id": "audit_sample_01", "engagement_id": "eng_sample_01", "share_token": "checkpoint-demo", "client_name": "Northstar Studio", "client_email": "hello@northstar.example", "accepted_at": "2025-02-14T10:30:00+00:00"})
+    # Backfill cleared_by fields on legacy sample data
+    sample_doc = await db.engagements.find_one({"engagement_id": "eng_sample_01"}, {"_id": 0})
+    if sample_doc and any(m.get("status") == "cleared" and not m.get("cleared_by_name") for m in sample_doc.get("milestones", [])):
+        for m in sample_doc["milestones"]:
+            if m.get("status") == "cleared" and not m.get("cleared_by_name"):
+                m["cleared_by_name"] = "Ava Chen"
+                m["cleared_by_email"] = "ava@northstar.example"
+                m["cleared_at"] = m.get("cleared_at") or "2025-02-20T12:00:00+00:00"
+        await db.engagements.update_one({"engagement_id": "eng_sample_01"}, {"$set": {"milestones": sample_doc["milestones"]}})

@@ -1,55 +1,447 @@
 import { useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, Alert, Linking, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, KeyboardAvoidingView, Linking, Platform, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import * as WebBrowser from "expo-web-browser";
 import * as SecureStore from "expo-secure-store";
+import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
 
 WebBrowser.maybeCompleteAuthSession();
 const API = `${Constants.expoConfig?.extra?.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
+const APP_ORIGIN = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 const colors = { bg: "#17151D", panel: "#221E2B", surface: "#F6F4F8", ink: "#17131D", muted: "#9A93A6", purple: "#9B6CFF", line: "#393244", green: "#55C49A", amber: "#DDAA62" };
-type Milestone = { milestone_id: string; title: string; fee: number; expense: number; status: string; payment_status: string; change_request?: string | null };
+type Milestone = { milestone_id: string; title: string; fee: number; expense: number; status: string; payment_status: string; change_request?: string | null; cleared_by_name?: string | null; cleared_by_email?: string | null; cleared_at?: string | null };
 type Engagement = { engagement_id: string; client_name: string; client_email?: string; share_token: string; status: string; scope_accepted_at?: string | null; milestones: Milestone[] };
+type Screen = "welcome" | "dashboard" | "create" | "share" | "agency" | "client" | "accept";
 
 const money = (n: number) => `$${n.toLocaleString("en-US", { minimumFractionDigits: 0 })}`;
+const formatDate = (iso?: string | null) => { if (!iso) return ""; try { const d = new Date(iso); return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); } catch { return ""; } };
 const getToken = async () => Platform.OS === "web" ? (globalThis as any).localStorage?.getItem("checkpoint_session") : SecureStore.getItemAsync("checkpoint_session");
 const saveToken = async (token: string) => Platform.OS === "web" ? (globalThis as any).localStorage?.setItem("checkpoint_session", token) : SecureStore.setItemAsync("checkpoint_session", token);
+const clearToken = async () => Platform.OS === "web" ? (globalThis as any).localStorage?.removeItem("checkpoint_session") : SecureStore.deleteItemAsync("checkpoint_session");
 
-function Path({ milestones, onSelect }: { milestones: Milestone[]; onSelect?: (m: Milestone) => void }) {
-  return <View style={styles.path}>{milestones.map((m, i) => <Pressable key={m.milestone_id} onPress={() => onSelect?.(m)} style={({ pressed }) => [styles.pathRow, pressed && styles.pressed]}>
+function Path({ milestones, onSelect, showClearedBy }: { milestones: Milestone[]; onSelect?: (m: Milestone) => void; showClearedBy?: boolean }) {
+  return <View style={styles.path}>{milestones.map((m, i) => <Pressable key={m.milestone_id} onPress={() => onSelect?.(m)} testID={`milestone-row-${i}`} style={({ pressed }) => [styles.pathRow, pressed && styles.pressed]}>
     <View style={styles.trackCol}><View style={[styles.marker, m.status === "cleared" && styles.markerCleared]}>{m.status === "cleared" ? <Ionicons name="checkmark" size={14} color={colors.bg} /> : <Text style={styles.markerText}>{String(i + 1).padStart(2, "0")}</Text>}</View>{i < milestones.length - 1 && <View style={[styles.track, m.status === "cleared" && styles.trackCleared]} />}</View>
-    <View style={styles.pathCopy}><Text style={styles.milestoneTitle}>{m.title}</Text><Text style={styles.milestoneMeta}>{money(m.fee)} fee {m.expense ? ` · ${money(m.expense)} expense` : ""}</Text></View><View style={[styles.statusDot, m.status === "cleared" && { backgroundColor: colors.green }]} />
+    <View style={styles.pathCopy}>
+      <Text style={styles.milestoneTitle}>{m.title}</Text>
+      <Text style={styles.milestoneMeta}>{money(m.fee)} fee {m.expense ? ` · ${money(m.expense)} expense` : ""}</Text>
+      {showClearedBy && m.status === "cleared" && m.cleared_by_name ? <Text style={styles.clearedByLine}>Cleared by {m.cleared_by_name}{m.cleared_at ? `, ${formatDate(m.cleared_at)}` : ""}</Text> : null}
+      {m.change_request ? <Text style={styles.changeRequestLine}>Change requested: {m.change_request}</Text> : null}
+    </View>
+    <View style={[styles.statusDot, m.status === "cleared" && { backgroundColor: colors.green }]} />
   </Pressable>)}</View>;
 }
 
-function Header({ onBack, eyebrow, title }: { onBack?: () => void; eyebrow: string; title: string }) {
-  return <View style={styles.header}>{onBack ? <Pressable onPress={onBack} style={styles.iconButton}><Ionicons name="arrow-back" size={21} color={colors.surface} /></Pressable> : <View style={styles.brandMark}><Ionicons name="navigate" size={17} color={colors.surface} /></View>}<View><Text style={styles.eyebrow}>{eyebrow}</Text><Text style={styles.headerTitle}>{title}</Text></View><View style={{ flex: 1 }} /><Text style={styles.wordmark}>CHECKPOINT</Text></View>;
+function Header({ onBack, eyebrow, title, right }: { onBack?: () => void; eyebrow: string; title: string; right?: React.ReactNode }) {
+  return <View style={styles.header}>{onBack ? <Pressable onPress={onBack} testID="header-back-button" style={styles.iconButton}><Ionicons name="arrow-back" size={21} color={colors.surface} /></Pressable> : <View style={styles.brandMark}><Ionicons name="navigate" size={17} color={colors.surface} /></View>}<View><Text style={styles.eyebrow}>{eyebrow}</Text><Text style={styles.headerTitle}>{title}</Text></View><View style={{ flex: 1 }} />{right || <Text style={styles.wordmark}>CHECKPOINT</Text>}</View>;
 }
 
 export default function Index() {
-  const [screen, setScreen] = useState<"welcome" | "agency" | "client" | "accept">("welcome");
+  const [screen, setScreen] = useState<Screen>("welcome");
   const [engagement, setEngagement] = useState<Engagement | null>(null);
+  const [engagements, setEngagements] = useState<Engagement[]>([]);
   const [loading, setLoading] = useState(false);
+  const [authed, setAuthed] = useState(false);
   const [clientName, setClientName] = useState("");
   const [clientEmail, setClientEmail] = useState("");
   const [active, setActive] = useState<Milestone | null>(null);
   const [changeNote, setChangeNote] = useState("");
+  const [clearName, setClearName] = useState("");
+  const [clearEmail, setClearEmail] = useState("");
   const [sessionChecked, setSessionChecked] = useState(false);
 
-  const loadSample = async () => { setLoading(true); try { const r = await fetch(`${API}/public/engagements/checkpoint-demo`); const data = await r.json(); setEngagement(data); setScreen("agency"); } catch { Alert.alert("Unable to load workspace", "Please try again."); } finally { setLoading(false); } };
-  const signIn = async () => { const redirect = Platform.OS === "web" ? `${window.location.origin}/` : Linking.createURL(""); const authUrl = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirect)}`; if (Platform.OS === "web") { window.location.href = authUrl; return; } const result = await WebBrowser.openAuthSessionAsync(authUrl, redirect); const url = (result as any).url || await Linking.getInitialURL(); const match = url?.match(/[?#&]session_id=([^&#]+)/); if (match) { const r = await fetch(`${API}/auth/session`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: decodeURIComponent(match[1]) }) }); const data = await r.json(); if (r.ok) { await saveToken(data.session_token); setScreen("agency"); } } };
-  useEffect(() => { (async () => { const pathToken = Platform.OS === "web" ? window.location.pathname.split("/").filter(Boolean).pop() : (await Linking.getInitialURL())?.match(/(?:token=|client\/)([^/?#]+)/)?.[1]; if (pathToken && pathToken !== "api" && pathToken !== "index.html") { const publicResponse = await fetch(`${API}/public/engagements/${pathToken}`); if (publicResponse.ok) { setEngagement(await publicResponse.json()); setScreen("client"); setSessionChecked(true); return; } } const t = await getToken(); if (t) { const r = await fetch(`${API}/auth/me`, { headers: { Authorization: `Bearer ${t}` } }); if (r.ok) setScreen("agency"); } setSessionChecked(true); })(); }, []);
+  // New engagement draft
+  const [draftName, setDraftName] = useState("");
+  const [draftEmail, setDraftEmail] = useState("");
+  const [draftMilestones, setDraftMilestones] = useState<{ title: string; fee: string; expense: string }[]>([]);
+  const [msTitle, setMsTitle] = useState("");
+  const [msFee, setMsFee] = useState("");
+  const [msExpense, setMsExpense] = useState("");
+
+  const fetchDashboard = async () => {
+    const t = await getToken();
+    if (!t) return;
+    const r = await fetch(`${API}/engagements`, { headers: { Authorization: `Bearer ${t}` } });
+    if (r.ok) setEngagements(await r.json());
+  };
+
+  const loadSample = async () => {
+    setLoading(true);
+    try { const r = await fetch(`${API}/public/engagements/checkpoint-demo`); const data = await r.json(); setEngagement(data); setScreen("agency"); }
+    catch { Alert.alert("Unable to load workspace", "Please try again."); }
+    finally { setLoading(false); }
+  };
+
+  const signIn = async () => {
+    const redirect = Platform.OS === "web" ? `${window.location.origin}/` : Linking.createURL("");
+    const authUrl = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirect)}`;
+    if (Platform.OS === "web") { window.location.href = authUrl; return; }
+    const result = await WebBrowser.openAuthSessionAsync(authUrl, redirect);
+    const url = (result as any).url || await Linking.getInitialURL();
+    const match = url?.match(/[?#&]session_id=([^&#]+)/);
+    if (match) {
+      const r = await fetch(`${API}/auth/session`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: decodeURIComponent(match[1]) }) });
+      const data = await r.json();
+      if (r.ok) { await saveToken(data.session_token); setAuthed(true); await fetchDashboard(); setScreen("dashboard"); }
+    }
+  };
+
+  const signOut = async () => { await clearToken(); setAuthed(false); setEngagements([]); setEngagement(null); setScreen("welcome"); };
+
+  useEffect(() => { (async () => {
+    // Client share link detection (web: /token, native: deep link)
+    const pathToken = Platform.OS === "web"
+      ? window.location.pathname.split("/").filter(Boolean).pop()
+      : (await Linking.getInitialURL())?.match(/(?:token=|client\/)([^/?#]+)/)?.[1];
+    // Web: also handle Google callback that lands here with #session_id=...
+    if (Platform.OS === "web") {
+      const hash = window.location.hash || "";
+      const hashMatch = hash.match(/session_id=([^&#]+)/);
+      if (hashMatch) {
+        const r = await fetch(`${API}/auth/session`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: decodeURIComponent(hashMatch[1]) }) });
+        const data = await r.json();
+        if (r.ok) { await saveToken(data.session_token); window.history.replaceState({}, "", "/"); setAuthed(true); const list = await fetch(`${API}/engagements`, { headers: { Authorization: `Bearer ${data.session_token}` } }); if (list.ok) setEngagements(await list.json()); setScreen("dashboard"); setSessionChecked(true); return; }
+      }
+    }
+    if (pathToken && pathToken !== "api" && pathToken !== "index.html") {
+      const publicResponse = await fetch(`${API}/public/engagements/${pathToken}`);
+      if (publicResponse.ok) { setEngagement(await publicResponse.json()); setScreen("client"); setSessionChecked(true); return; }
+    }
+    const t = await getToken();
+    if (t) {
+      const r = await fetch(`${API}/auth/me`, { headers: { Authorization: `Bearer ${t}` } });
+      if (r.ok) { setAuthed(true); const list = await fetch(`${API}/engagements`, { headers: { Authorization: `Bearer ${t}` } }); if (list.ok) setEngagements(await list.json()); setScreen("dashboard"); }
+    }
+    setSessionChecked(true);
+  })(); }, []);
+
   const cleared = useMemo(() => engagement?.milestones.filter(m => m.status === "cleared").length || 0, [engagement]);
-  const accept = async () => { if (!engagement) return; setLoading(true); const r = await fetch(`${API}/public/engagements/${engagement.share_token}/accept`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ client_name: clientName || undefined, client_email: clientEmail || undefined }) }); if (r.ok) { setEngagement(await r.json()); setScreen("client"); } setLoading(false); };
-  const clear = async (m: Milestone) => { if (!engagement) return; setLoading(true); const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/clear`, { method: "POST" }); if (r.ok) { setEngagement(await r.json()); setActive(null); } setLoading(false); };
-  const requestChange = async (m: Milestone) => { if (!engagement || !changeNote.trim()) return; setLoading(true); const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/request-change`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: changeNote.trim() }) }); if (r.ok) { setEngagement(await r.json()); setChangeNote(""); setActive(null); } setLoading(false); };
+
+  const accept = async () => {
+    if (!engagement) return;
+    setLoading(true);
+    const r = await fetch(`${API}/public/engagements/${engagement.share_token}/accept`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ client_name: clientName || undefined, client_email: clientEmail || undefined }) });
+    if (r.ok) { setEngagement(await r.json()); setScreen("client"); }
+    setLoading(false);
+  };
+
+  const clear = async (m: Milestone) => {
+    if (!engagement) return;
+    setLoading(true);
+    const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/clear`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ client_name: clearName || undefined, client_email: clearEmail || undefined }) });
+    if (r.ok) { setEngagement(await r.json()); setActive(null); setClearName(""); setClearEmail(""); }
+    setLoading(false);
+  };
+
+  const requestChange = async (m: Milestone) => {
+    if (!engagement || !changeNote.trim()) return;
+    setLoading(true);
+    const r = await fetch(`${API}/public/engagements/${engagement.share_token}/milestones/${m.milestone_id}/request-change`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: changeNote.trim() }) });
+    if (r.ok) { setEngagement(await r.json()); setChangeNote(""); setActive(null); }
+    setLoading(false);
+  };
+
+  const addDraftMilestone = () => {
+    const fee = parseFloat(msFee || "0");
+    if (!msTitle.trim() || isNaN(fee) || fee <= 0) { Alert.alert("Missing details", "Every checkpoint needs a description and a fee."); return; }
+    setDraftMilestones(prev => [...prev, { title: msTitle.trim(), fee: String(fee), expense: msExpense || "0" }]);
+    setMsTitle(""); setMsFee(""); setMsExpense("");
+  };
+
+  const removeDraftMilestone = (idx: number) => setDraftMilestones(prev => prev.filter((_, i) => i !== idx));
+
+  const submitEngagement = async () => {
+    if (!draftName.trim() || draftMilestones.length === 0) { Alert.alert("Not ready", "Add a client name and at least one checkpoint."); return; }
+    const t = await getToken();
+    if (!t) return;
+    setLoading(true);
+    const body = { client_name: draftName.trim(), client_email: draftEmail.trim() || undefined, milestones: draftMilestones.map(m => ({ title: m.title, fee: parseFloat(m.fee || "0"), expense: parseFloat(m.expense || "0") })) };
+    const r = await fetch(`${API}/engagements`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` }, body: JSON.stringify(body) });
+    if (r.ok) {
+      const created = await r.json();
+      setEngagement(created);
+      setEngagements(prev => [created, ...prev]);
+      setDraftName(""); setDraftEmail(""); setDraftMilestones([]); setMsTitle(""); setMsFee(""); setMsExpense("");
+      setScreen("share");
+    } else {
+      Alert.alert("Could not create engagement", "Please try again.");
+    }
+    setLoading(false);
+  };
+
+  const shareUrl = engagement ? `${APP_ORIGIN}/${engagement.share_token}` : "";
+  const copyShareLink = async () => { if (!shareUrl) return; try { await Clipboard.setStringAsync(shareUrl); Alert.alert("Link copied", "Share it with your client."); } catch {} };
+
+  const openEngagement = async (e: Engagement) => {
+    setLoading(true);
+    const r = await fetch(`${API}/public/engagements/${e.share_token}`);
+    if (r.ok) { setEngagement(await r.json()); setScreen("agency"); }
+    setLoading(false);
+  };
 
   if (!sessionChecked) return <View style={styles.loading}><ActivityIndicator color={colors.purple} /></View>;
-  if (screen === "welcome") return <SafeAreaView style={styles.app}><View style={styles.welcome}><View style={styles.logoLarge}><Ionicons name="navigate" size={27} color={colors.surface} /></View><Text style={styles.display}>Work moves{Platform.OS === "web" ? " online" : " forward"}.</Text><Text style={styles.lede}>Checkpoint keeps scope, approvals, and milestone payments on one clear trajectory.</Text><Pressable onPress={signIn} style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed]}><Ionicons name="logo-google" size={18} color={colors.surface} /><Text style={styles.primaryText}>Continue with Google</Text></Pressable><Pressable onPress={loadSample} style={styles.secondaryButton}><Text style={styles.secondaryText}>Explore sample workspace</Text><Ionicons name="arrow-forward" size={17} color={colors.purple} /></Pressable><Text style={styles.footnote}>For agencies and clients who value a clean record.</Text></View></SafeAreaView>;
+
+  if (screen === "welcome") return <SafeAreaView style={styles.app}>
+    <View style={styles.welcome}>
+      <View style={styles.logoLarge}><Ionicons name="navigate" size={27} color={colors.surface} /></View>
+      <Text style={styles.display}>Work moves{Platform.OS === "web" ? " online" : " forward"}.</Text>
+      <Text style={styles.lede}>Checkpoint keeps scope, approvals, and milestone payments on one clear trajectory.</Text>
+      <Pressable onPress={signIn} testID="google-signin-button" style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed]}><Ionicons name="logo-google" size={18} color={colors.surface} /><Text style={styles.primaryText}>Continue with Google</Text></Pressable>
+      <Pressable onPress={loadSample} testID="explore-sample-button" style={styles.secondaryButton}><Text style={styles.secondaryText}>Explore sample workspace</Text><Ionicons name="arrow-forward" size={17} color={colors.purple} /></Pressable>
+      <Text style={styles.footnote}>For agencies and clients who value a clean record.</Text>
+    </View>
+  </SafeAreaView>;
+
+  if (screen === "dashboard") return <SafeAreaView style={styles.app}>
+    <Header eyebrow="AGENCY CONTROL" title="Engagements" right={<Pressable onPress={signOut} testID="sign-out-button" style={styles.textButton}><Text style={styles.textButtonLabel}>Sign out</Text></Pressable>} />
+    <ScrollView contentContainerStyle={styles.content}>
+      <View style={styles.dashboardTop}>
+        <View><Text style={styles.sectionLabel}>ACTIVE ENGAGEMENTS</Text><Text style={styles.bigStat}>{engagements.length} <Text style={styles.bigStatMuted}>total</Text></Text></View>
+        <Pressable onPress={() => setScreen("create")} testID="new-engagement-button" style={styles.newButton}><Ionicons name="add" size={18} color={colors.surface} /><Text style={styles.primaryText}>New engagement</Text></Pressable>
+      </View>
+      {engagements.length === 0 ? <View style={styles.emptyPanel}>
+        <Ionicons name="navigate-outline" size={28} color={colors.muted} />
+        <Text style={styles.emptyTitle}>No engagements yet</Text>
+        <Text style={styles.emptyBody}>Start a new engagement to define the trajectory and share the plan with your client.</Text>
+      </View> : engagements.map(e => {
+        const clearedCount = e.milestones.filter(m => m.status === "cleared").length;
+        const paidCount = e.milestones.filter(m => m.payment_status === "paid").length;
+        const requestedCount = e.milestones.filter(m => m.payment_status === "requested").length;
+        return <Pressable key={e.engagement_id} onPress={() => openEngagement(e)} testID={`engagement-card-${e.engagement_id}`} style={({ pressed }) => [styles.engagementCard, pressed && styles.pressed]}>
+          <View style={styles.rowBetween}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.engagementName}>{e.client_name}</Text>
+              <Text style={styles.engagementMeta}>{clearedCount} of {e.milestones.length} milestones cleared</Text>
+            </View>
+            <View style={styles.statusPill}><View style={[styles.pillDot, e.status !== "active" && { backgroundColor: colors.amber }]} /><Text style={styles.pillText}>{e.status === "active" ? "ACTIVE" : "AWAITING SCOPE"}</Text></View>
+          </View>
+          <View style={styles.progressBar}><View style={[styles.progressFill, { width: `${(clearedCount / e.milestones.length) * 100}%` }]} /></View>
+          <View style={styles.rowBetween}>
+            <Text style={styles.engagementMeta}>{paidCount} paid · {requestedCount} awaiting payment</Text>
+            <Text style={styles.engagementLink}>/{e.share_token.slice(0, 12)}…</Text>
+          </View>
+        </Pressable>;
+      })}
+    </ScrollView>
+  </SafeAreaView>;
+
+  if (screen === "create") return <SafeAreaView style={styles.app}>
+    <Header onBack={() => setScreen("dashboard")} eyebrow="NEW ENGAGEMENT" title="Define trajectory" />
+    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <View style={styles.lightCard}>
+          <Text style={styles.cardKicker}>STEP 1 · CLIENT</Text>
+          <Text style={styles.cardTitle}>Who is this engagement with?</Text>
+          <TextInput placeholder="Client name" placeholderTextColor="#9A93A6" value={draftName} onChangeText={setDraftName} testID="draft-client-name-input" style={styles.input} />
+          <TextInput placeholder="Client email (optional)" placeholderTextColor="#9A93A6" value={draftEmail} onChangeText={setDraftEmail} keyboardType="email-address" autoCapitalize="none" testID="draft-client-email-input" style={styles.input} />
+        </View>
+        <View style={styles.lightCard}>
+          <Text style={styles.cardKicker}>STEP 2 · CHECKPOINTS</Text>
+          <Text style={styles.cardTitle}>Add each milestone.</Text>
+          <Text style={styles.bodyDark}>List them in the order they should be cleared. Each generates a payment request when the client clears it.</Text>
+          {draftMilestones.length > 0 && <View style={styles.draftList}>{draftMilestones.map((m, i) => <View key={i} style={styles.draftRow}>
+            <View style={styles.draftIndex}><Text style={styles.draftIndexText}>{String(i + 1).padStart(2, "0")}</Text></View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.draftTitle}>{m.title}</Text>
+              <Text style={styles.draftMeta}>{money(parseFloat(m.fee))} fee{parseFloat(m.expense) > 0 ? ` · ${money(parseFloat(m.expense))} expense` : ""}</Text>
+            </View>
+            <Pressable onPress={() => removeDraftMilestone(i)} testID={`remove-draft-${i}`} style={styles.close}><Ionicons name="close" size={18} color={colors.ink} /></Pressable>
+          </View>)}</View>}
+          <TextInput placeholder="Checkpoint description" placeholderTextColor="#9A93A6" value={msTitle} onChangeText={setMsTitle} testID="milestone-title-input" style={styles.input} />
+          <View style={styles.rowGap}>
+            <TextInput placeholder="Fee (USD)" placeholderTextColor="#9A93A6" value={msFee} onChangeText={setMsFee} keyboardType="decimal-pad" testID="milestone-fee-input" style={[styles.input, { flex: 1 }]} />
+            <TextInput placeholder="Expense (optional)" placeholderTextColor="#9A93A6" value={msExpense} onChangeText={setMsExpense} keyboardType="decimal-pad" testID="milestone-expense-input" style={[styles.input, { flex: 1 }]} />
+          </View>
+          <Pressable onPress={addDraftMilestone} testID="add-milestone-button" style={styles.outlineButton}><Ionicons name="add" size={17} color={colors.ink} /><Text style={styles.changeText}>Add checkpoint</Text></Pressable>
+        </View>
+        <View style={styles.lightCard}>
+          <Text style={styles.cardKicker}>STEP 3 · READY</Text>
+          <Text style={styles.cardTitle}>Create engagement</Text>
+          <Text style={styles.bodyDark}>{`A shareable link will be generated. Send it to your client — they'll accept scope before work begins.`}</Text>
+          <Pressable onPress={submitEngagement} disabled={loading} testID="submit-engagement-button" style={styles.darkButton}>{loading ? <ActivityIndicator color={colors.surface} /> : <><Text style={styles.primaryText}>Generate share link</Text><Ionicons name="arrow-forward" size={19} color={colors.surface} /></>}</Pressable>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  </SafeAreaView>;
+
+  if (screen === "share" && engagement) return <SafeAreaView style={styles.app}>
+    <Header onBack={() => setScreen("dashboard")} eyebrow="READY TO SHARE" title={engagement.client_name} />
+    <ScrollView contentContainerStyle={styles.content}>
+      <View style={styles.lightCard}>
+        <Text style={styles.cardKicker}>ENGAGEMENT CREATED</Text>
+        <Text style={styles.cardTitle}>Share this link with your client.</Text>
+        <Text style={styles.bodyDark}>{`They'll review the trajectory and accept the full plan before any checkpoint moves.`}</Text>
+        <View style={styles.linkBox}>
+          <Ionicons name="link-outline" size={18} color={colors.purple} />
+          <Text style={styles.linkText} numberOfLines={1} testID="share-link-text">{shareUrl}</Text>
+        </View>
+        <Pressable onPress={copyShareLink} testID="copy-link-button" style={styles.darkButton}><Ionicons name="copy-outline" size={18} color={colors.surface} /><Text style={styles.primaryText}>Copy link</Text></Pressable>
+        <Pressable onPress={() => setScreen("agency")} testID="view-engagement-button" style={styles.outlineButton}><Text style={styles.changeText}>Open engagement</Text><Ionicons name="arrow-forward" size={17} color={colors.ink} /></Pressable>
+      </View>
+    </ScrollView>
+  </SafeAreaView>;
+
   if (!engagement) return null;
-  if (screen === "accept") return <SafeAreaView style={styles.app}><Header onBack={() => setScreen("client")} eyebrow="REVIEW REQUIRED" title="Accept scope" /><ScrollView contentContainerStyle={styles.content}><View style={styles.lightCard}><Text style={styles.cardKicker}>BEFORE WORK BEGINS</Text><Text style={styles.cardTitle}>Confirm the full plan.</Text><Text style={styles.bodyDark}>Review the trajectory below. Your timestamped acceptance is the shared record that unlocks the first checkpoint.</Text><Path milestones={engagement.milestones} /><TextInput placeholder="Your name (optional)" placeholderTextColor="#9A93A6" value={clientName} onChangeText={setClientName} style={styles.input} /><TextInput placeholder="Email (optional)" placeholderTextColor="#9A93A6" value={clientEmail} onChangeText={setClientEmail} keyboardType="email-address" style={styles.input} /><Pressable onPress={accept} style={styles.darkButton}>{loading ? <ActivityIndicator color={colors.surface} /> : <><Text style={styles.primaryText}>Accept scope & schedule</Text><Ionicons name="checkmark-circle-outline" size={19} color={colors.surface} /></>}</Pressable></View></ScrollView></SafeAreaView>;
+
+  if (screen === "accept") return <SafeAreaView style={styles.app}>
+    <Header onBack={() => setScreen("client")} eyebrow="REVIEW REQUIRED" title="Accept scope" />
+    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <View style={styles.lightCard}>
+          <Text style={styles.cardKicker}>BEFORE WORK BEGINS</Text>
+          <Text style={styles.cardTitle}>Confirm the full plan.</Text>
+          <Text style={styles.bodyDark}>Review the trajectory below. Your timestamped acceptance is the shared record that unlocks the first checkpoint.</Text>
+          <Path milestones={engagement.milestones} />
+          <TextInput placeholder="Your name (optional)" placeholderTextColor="#9A93A6" value={clientName} onChangeText={setClientName} testID="accept-name-input" style={styles.input} />
+          <TextInput placeholder="Email (optional)" placeholderTextColor="#9A93A6" value={clientEmail} onChangeText={setClientEmail} keyboardType="email-address" autoCapitalize="none" testID="accept-email-input" style={styles.input} />
+          <Pressable onPress={accept} testID="accept-scope-button" style={styles.darkButton}>{loading ? <ActivityIndicator color={colors.surface} /> : <><Text style={styles.primaryText}>Accept scope & schedule</Text><Ionicons name="checkmark-circle-outline" size={19} color={colors.surface} /></>}</Pressable>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  </SafeAreaView>;
+
   const isClient = screen === "client";
-  return <SafeAreaView style={styles.app}><Header onBack={isClient ? () => setScreen("welcome") : undefined} eyebrow={isClient ? "CLIENT PORTAL" : "AGENCY CONTROL"} title={engagement.client_name} /><ScrollView contentContainerStyle={styles.content}><View style={styles.topline}><View><Text style={styles.sectionLabel}>{isClient ? "ENGAGEMENT STATUS" : "ACTIVE ENGAGEMENT"}</Text><Text style={styles.bigStat}>{cleared} <Text style={styles.bigStatMuted}>/ {engagement.milestones.length}</Text></Text><Text style={styles.statCaption}>checkpoints cleared</Text></View><View style={styles.statusPill}><View style={styles.pillDot} /><Text style={styles.pillText}>{engagement.status === "active" ? "ACTIVE" : "AWAITING SCOPE"}</Text></View></View>{isClient && engagement.status !== "active" && <Pressable onPress={() => setScreen("accept")} style={styles.notice}><Ionicons name="lock-open-outline" size={19} color={colors.purple} /><View style={{ flex: 1 }}><Text style={styles.noticeTitle}>Scope acceptance required</Text><Text style={styles.noticeBody}>Accept the plan before the first milestone can move.</Text></View><Ionicons name="chevron-forward" size={18} color={colors.purple} /></Pressable>}{!isClient && <Pressable onPress={() => setScreen("client")} style={styles.clientButton}><Ionicons name="link-outline" size={18} color={colors.purple} /><Text style={styles.clientButtonText}>Open client portal</Text><Ionicons name="arrow-forward" size={17} color={colors.purple} /></Pressable>}<View style={styles.sectionHead}><Text style={styles.sectionTitle}>Trajectory</Text><Text style={styles.sectionHint}>{isClient ? "Tap a checkpoint to review" : "Shared with client"}</Text></View><View style={styles.pathCard}><Path milestones={engagement.milestones} onSelect={setActive} /></View>{!isClient && <View style={styles.agencyRow}><Text style={styles.sectionTitle}>Payment pulse</Text><Text style={styles.sectionHint}>Share link · /{engagement.share_token}</Text></View>}{active && <View style={styles.lightCard}><View style={styles.rowBetween}><View><Text style={styles.cardKicker}>CHECKPOINT {engagement.milestones.indexOf(active) + 1}</Text><Text style={styles.cardTitle}>{active.title}</Text></View><Pressable onPress={() => setActive(null)} style={styles.close}><Ionicons name="close" size={19} color={colors.ink} /></Pressable></View><Text style={styles.bodyDark}>{active.status === "cleared" ? "This checkpoint is cleared. A payment request has been generated for the milestone amount." : "Review the deliverable, then clear it or request changes before work proceeds."}</Text><View style={styles.paymentLine}><Text style={styles.paymentLabel}>Milestone fee</Text><Text style={styles.paymentAmount}>{money(active.fee)}</Text></View>{active.status !== "cleared" && isClient && engagement.status === "active" && <><TextInput placeholder="What needs to change?" placeholderTextColor="#9A93A6" value={changeNote} onChangeText={setChangeNote} style={styles.input} /><View style={styles.actionRow}><Pressable onPress={() => clear(active)} style={styles.darkButton}><Text style={styles.primaryText}>Clear checkpoint</Text></Pressable><Pressable onPress={() => requestChange(active)} style={styles.changeButton}><Text style={styles.changeText}>Request changes</Text></Pressable></View></>}{active.status === "cleared" && <View style={styles.paymentRequest}><Ionicons name="link-outline" size={18} color={colors.purple} /><Text style={styles.paymentRequestText}>Payment request ready · placeholder link</Text></View>}</View>}</ScrollView></SafeAreaView>;
+  const backTo = isClient ? undefined : (authed ? () => setScreen("dashboard") : () => setScreen("welcome"));
+
+  return <SafeAreaView style={styles.app}>
+    <Header onBack={backTo} eyebrow={isClient ? "CLIENT PORTAL" : "AGENCY CONTROL"} title={engagement.client_name} />
+    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
+    <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+      <View style={styles.topline}>
+        <View><Text style={styles.sectionLabel}>{isClient ? "ENGAGEMENT STATUS" : "ACTIVE ENGAGEMENT"}</Text><Text style={styles.bigStat}>{cleared} <Text style={styles.bigStatMuted}>/ {engagement.milestones.length}</Text></Text><Text style={styles.statCaption}>checkpoints cleared</Text></View>
+        <View style={styles.statusPill}><View style={[styles.pillDot, engagement.status !== "active" && { backgroundColor: colors.amber }]} /><Text style={styles.pillText}>{engagement.status === "active" ? "ACTIVE" : "AWAITING SCOPE"}</Text></View>
+      </View>
+      {isClient && engagement.status !== "active" && <Pressable onPress={() => setScreen("accept")} testID="open-accept-button" style={styles.notice}><Ionicons name="lock-open-outline" size={19} color={colors.purple} /><View style={{ flex: 1 }}><Text style={styles.noticeTitle}>Scope acceptance required</Text><Text style={styles.noticeBody}>Accept the plan before the first milestone can move.</Text></View><Ionicons name="chevron-forward" size={18} color={colors.purple} /></Pressable>}
+      {!isClient && <View style={styles.linkBoxDark}><Ionicons name="link-outline" size={16} color={colors.purple} /><Text style={styles.linkTextDark} numberOfLines={1} testID="agency-share-link">{shareUrl}</Text><Pressable onPress={copyShareLink} testID="agency-copy-link" style={styles.smallCopy}><Ionicons name="copy-outline" size={15} color={colors.purple} /></Pressable></View>}
+      <View style={styles.sectionHead}><Text style={styles.sectionTitle}>Trajectory</Text><Text style={styles.sectionHint}>{isClient ? "Tap a checkpoint to review" : "Shared with client"}</Text></View>
+      <View style={styles.pathCard}><Path milestones={engagement.milestones} onSelect={setActive} showClearedBy /></View>
+      {active && <View style={styles.lightCard}>
+        <View style={styles.rowBetween}>
+          <View><Text style={styles.cardKicker}>CHECKPOINT {engagement.milestones.indexOf(active) + 1}</Text><Text style={styles.cardTitle}>{active.title}</Text></View>
+          <Pressable onPress={() => { setActive(null); setChangeNote(""); setClearName(""); setClearEmail(""); }} testID="close-milestone-button" style={styles.close}><Ionicons name="close" size={19} color={colors.ink} /></Pressable>
+        </View>
+        <Text style={styles.bodyDark}>{active.status === "cleared" ? "This checkpoint is cleared. A payment request has been generated for the milestone amount." : "Review the deliverable, then clear it or request changes before work proceeds."}</Text>
+        {active.status === "cleared" && active.cleared_by_name ? <Text style={styles.clearedByLineDark}>Cleared by {active.cleared_by_name}{active.cleared_at ? `, ${formatDate(active.cleared_at)}` : ""}</Text> : null}
+        <View style={styles.paymentLine}><Text style={styles.paymentLabel}>Milestone fee</Text><Text style={styles.paymentAmount}>{money(active.fee)}</Text></View>
+        {active.expense > 0 && <View style={styles.paymentLineInner}><Text style={styles.paymentLabel}>Expense</Text><Text style={styles.paymentAmountSm}>{money(active.expense)}</Text></View>}
+        {active.status !== "cleared" && isClient && engagement.status === "active" && <>
+          <Text style={styles.subKicker}>YOUR NAME & EMAIL (FOR THE RECORD)</Text>
+          <TextInput placeholder="Your name" placeholderTextColor="#9A93A6" value={clearName} onChangeText={setClearName} testID="clear-name-input" style={styles.input} />
+          <TextInput placeholder="Email (optional)" placeholderTextColor="#9A93A6" value={clearEmail} onChangeText={setClearEmail} keyboardType="email-address" autoCapitalize="none" testID="clear-email-input" style={styles.input} />
+          <TextInput placeholder="What needs to change?" placeholderTextColor="#9A93A6" value={changeNote} onChangeText={setChangeNote} testID="change-note-input" style={styles.input} />
+          <View style={styles.actionRow}>
+            <Pressable onPress={() => clear(active)} testID="clear-milestone-button" style={styles.darkButton}>{loading ? <ActivityIndicator color={colors.surface} /> : <Text style={styles.primaryText}>Clear checkpoint</Text>}</Pressable>
+            <Pressable onPress={() => requestChange(active)} testID="request-change-button" style={styles.changeButton}><Text style={styles.changeText}>Request changes</Text></Pressable>
+          </View>
+        </>}
+        {active.status === "cleared" && <View style={styles.paymentRequest}>
+          <Ionicons name="link-outline" size={18} color={colors.purple} />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.paymentRequestText}>Payment request · {money(active.fee)}</Text>
+            <Text style={styles.paymentRequestSub}>Placeholder link — connects to a real payment gateway in production.</Text>
+          </View>
+        </View>}
+      </View>}
+    </ScrollView>
+    </KeyboardAvoidingView>
+  </SafeAreaView>;
 }
 
-const styles = StyleSheet.create({ app: { flex: 1, backgroundColor: colors.bg }, loading: { flex: 1, backgroundColor: colors.bg, alignItems: "center", justifyContent: "center" }, welcome: { flex: 1, padding: 28, justifyContent: "center", maxWidth: 560, alignSelf: "center", width: "100%" }, logoLarge: { width: 54, height: 54, borderRadius: 16, backgroundColor: colors.purple, alignItems: "center", justifyContent: "center", marginBottom: 30 }, display: { color: colors.surface, fontSize: 40, lineHeight: 45, fontWeight: "800", letterSpacing: -1.5, maxWidth: 390 }, lede: { color: colors.muted, fontSize: 17, lineHeight: 26, marginTop: 18, maxWidth: 420, marginBottom: 38 }, primaryButton: { backgroundColor: colors.purple, minHeight: 54, borderRadius: 8, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, primaryText: { color: colors.surface, fontWeight: "700", fontSize: 15 }, secondaryButton: { minHeight: 54, borderRadius: 8, borderWidth: 1, borderColor: colors.line, marginTop: 12, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 12 }, secondaryText: { color: colors.surface, fontSize: 15, fontWeight: "600" }, footnote: { color: colors.muted, textAlign: "center", fontSize: 12, marginTop: 35 }, header: { minHeight: 82, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", gap: 12, borderBottomWidth: 1, borderBottomColor: colors.line }, brandMark: { width: 34, height: 34, borderRadius: 10, backgroundColor: colors.purple, alignItems: "center", justifyContent: "center" }, iconButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" }, eyebrow: { color: colors.purple, fontSize: 10, fontWeight: "800", letterSpacing: 1.5 }, headerTitle: { color: colors.surface, fontSize: 20, fontWeight: "700", marginTop: 2 }, wordmark: { color: colors.muted, fontSize: 10, fontWeight: "800", letterSpacing: 1.5 }, content: { padding: 22, paddingBottom: 60, maxWidth: 720, width: "100%", alignSelf: "center" }, topline: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingVertical: 22 }, sectionLabel: { color: colors.muted, fontSize: 11, fontWeight: "800", letterSpacing: 1.3 }, bigStat: { color: colors.surface, fontSize: 48, fontWeight: "800", marginTop: 3 }, bigStatMuted: { color: colors.muted, fontSize: 24 }, statCaption: { color: colors.muted, fontSize: 13, marginTop: -4 }, statusPill: { flexDirection: "row", gap: 7, alignItems: "center", borderWidth: 1, borderColor: colors.line, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 20 }, pillDot: { width: 7, height: 7, borderRadius: 7, backgroundColor: colors.green }, pillText: { color: colors.surface, fontSize: 10, fontWeight: "800", letterSpacing: 1 }, sectionHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "baseline", marginTop: 16, marginBottom: 12 }, sectionTitle: { color: colors.surface, fontWeight: "700", fontSize: 19 }, sectionHint: { color: colors.muted, fontSize: 12 }, pathCard: { backgroundColor: colors.panel, borderRadius: 12, padding: 18 }, path: { paddingVertical: 2 }, pathRow: { minHeight: 64, flexDirection: "row", alignItems: "flex-start" }, trackCol: { width: 30, alignItems: "center" }, marker: { width: 28, height: 28, borderRadius: 14, borderWidth: 1, borderColor: colors.muted, alignItems: "center", justifyContent: "center", backgroundColor: colors.panel, zIndex: 1 }, markerCleared: { borderColor: colors.green, backgroundColor: colors.green }, markerText: { color: colors.muted, fontSize: 10, fontWeight: "800" }, track: { width: 1, flex: 1, minHeight: 36, backgroundColor: colors.line }, trackCleared: { backgroundColor: colors.green }, pathCopy: { flex: 1, paddingLeft: 14, paddingTop: 1 }, milestoneTitle: { color: colors.surface, fontSize: 15, fontWeight: "600" }, milestoneMeta: { color: colors.muted, fontSize: 12, marginTop: 4 }, statusDot: { width: 7, height: 7, borderRadius: 7, backgroundColor: colors.line, marginTop: 10 }, notice: { backgroundColor: "#2A2338", borderWidth: 1, borderColor: "#60469A", borderRadius: 10, padding: 15, flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 25 }, noticeTitle: { color: colors.surface, fontWeight: "700", fontSize: 14 }, noticeBody: { color: "#C2B8D5", fontSize: 12, marginTop: 3 }, clientButton: { minHeight: 48, borderWidth: 1, borderColor: "#60469A", borderRadius: 8, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }, clientButtonText: { color: colors.surface, fontWeight: "700", fontSize: 14 }, lightCard: { backgroundColor: colors.surface, borderRadius: 12, padding: 22, marginTop: 18 }, cardKicker: { color: colors.purple, fontSize: 10, fontWeight: "800", letterSpacing: 1.3 }, cardTitle: { color: colors.ink, fontSize: 23, fontWeight: "800", marginTop: 7 }, bodyDark: { color: "#625B6B", fontSize: 14, lineHeight: 21, marginTop: 10 }, input: { borderBottomWidth: 1, borderBottomColor: "#D7D1DD", paddingVertical: 14, color: colors.ink, fontSize: 15, marginTop: 8 }, darkButton: { backgroundColor: colors.ink, minHeight: 52, borderRadius: 8, marginTop: 18, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, actionRow: { gap: 10 }, changeButton: { minHeight: 46, borderWidth: 1, borderColor: "#D0C6DA", borderRadius: 8, alignItems: "center", justifyContent: "center" }, changeText: { color: colors.ink, fontWeight: "700", fontSize: 14 }, rowBetween: { flexDirection: "row", justifyContent: "space-between" }, close: { width: 36, height: 36, alignItems: "center", justifyContent: "center" }, paymentLine: { borderTopWidth: 1, borderBottomWidth: 1, borderColor: "#DDD7E1", marginTop: 20, paddingVertical: 14, flexDirection: "row", justifyContent: "space-between" }, paymentLabel: { color: "#625B6B", fontSize: 13 }, paymentAmount: { color: colors.ink, fontWeight: "800", fontSize: 16 }, paymentRequest: { flexDirection: "row", alignItems: "center", gap: 9, marginTop: 16 }, paymentRequestText: { color: colors.purple, fontSize: 13, fontWeight: "700" }, agencyRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "baseline", marginTop: 30 }, pressed: { opacity: 0.72 } });
+const styles = StyleSheet.create({
+  app: { flex: 1, backgroundColor: colors.bg },
+  loading: { flex: 1, backgroundColor: colors.bg, alignItems: "center", justifyContent: "center" },
+  welcome: { flex: 1, padding: 28, justifyContent: "center", maxWidth: 560, alignSelf: "center", width: "100%" },
+  logoLarge: { width: 54, height: 54, borderRadius: 16, backgroundColor: colors.purple, alignItems: "center", justifyContent: "center", marginBottom: 30 },
+  display: { color: colors.surface, fontSize: 40, lineHeight: 45, fontWeight: "800", letterSpacing: -1.5, maxWidth: 390 },
+  lede: { color: colors.muted, fontSize: 17, lineHeight: 26, marginTop: 18, maxWidth: 420, marginBottom: 38 },
+  primaryButton: { backgroundColor: colors.purple, minHeight: 54, borderRadius: 8, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 },
+  primaryText: { color: colors.surface, fontWeight: "700", fontSize: 15 },
+  secondaryButton: { minHeight: 54, borderRadius: 8, borderWidth: 1, borderColor: colors.line, marginTop: 12, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 12 },
+  secondaryText: { color: colors.surface, fontSize: 15, fontWeight: "600" },
+  footnote: { color: colors.muted, textAlign: "center", fontSize: 12, marginTop: 35 },
+  header: { minHeight: 82, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", gap: 12, borderBottomWidth: 1, borderBottomColor: colors.line },
+  brandMark: { width: 34, height: 34, borderRadius: 10, backgroundColor: colors.purple, alignItems: "center", justifyContent: "center" },
+  iconButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  eyebrow: { color: colors.purple, fontSize: 10, fontWeight: "800", letterSpacing: 1.5 },
+  headerTitle: { color: colors.surface, fontSize: 20, fontWeight: "700", marginTop: 2 },
+  wordmark: { color: colors.muted, fontSize: 10, fontWeight: "800", letterSpacing: 1.5 },
+  textButton: { paddingHorizontal: 10, paddingVertical: 6 },
+  textButtonLabel: { color: colors.muted, fontSize: 12, fontWeight: "700", letterSpacing: 0.5 },
+  content: { padding: 22, paddingBottom: 60, maxWidth: 720, width: "100%", alignSelf: "center" },
+  topline: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", paddingVertical: 22 },
+  dashboardTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-end", paddingTop: 12, paddingBottom: 22 },
+  newButton: { backgroundColor: colors.purple, paddingHorizontal: 18, minHeight: 46, borderRadius: 8, flexDirection: "row", alignItems: "center", gap: 8 },
+  sectionLabel: { color: colors.muted, fontSize: 11, fontWeight: "800", letterSpacing: 1.3 },
+  bigStat: { color: colors.surface, fontSize: 48, fontWeight: "800", marginTop: 3 },
+  bigStatMuted: { color: colors.muted, fontSize: 24 },
+  statCaption: { color: colors.muted, fontSize: 13, marginTop: -4 },
+  statusPill: { flexDirection: "row", gap: 7, alignItems: "center", borderWidth: 1, borderColor: colors.line, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 20 },
+  pillDot: { width: 7, height: 7, borderRadius: 7, backgroundColor: colors.green },
+  pillText: { color: colors.surface, fontSize: 10, fontWeight: "800", letterSpacing: 1 },
+  sectionHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "baseline", marginTop: 16, marginBottom: 12 },
+  sectionTitle: { color: colors.surface, fontWeight: "700", fontSize: 19 },
+  sectionHint: { color: colors.muted, fontSize: 12 },
+  pathCard: { backgroundColor: colors.panel, borderRadius: 12, padding: 18 },
+  path: { paddingVertical: 2 },
+  pathRow: { minHeight: 64, flexDirection: "row", alignItems: "flex-start" },
+  trackCol: { width: 30, alignItems: "center" },
+  marker: { width: 28, height: 28, borderRadius: 14, borderWidth: 1, borderColor: colors.muted, alignItems: "center", justifyContent: "center", backgroundColor: colors.panel },
+  markerCleared: { borderColor: colors.green, backgroundColor: colors.green },
+  markerText: { color: colors.muted, fontSize: 10, fontWeight: "800" },
+  track: { width: 1, flex: 1, minHeight: 36, backgroundColor: colors.line },
+  trackCleared: { backgroundColor: colors.green },
+  pathCopy: { flex: 1, paddingLeft: 14, paddingTop: 1 },
+  milestoneTitle: { color: colors.surface, fontSize: 15, fontWeight: "600" },
+  milestoneMeta: { color: colors.muted, fontSize: 12, marginTop: 4 },
+  clearedByLine: { color: colors.green, fontSize: 11, marginTop: 4, fontWeight: "600" },
+  changeRequestLine: { color: colors.amber, fontSize: 11, marginTop: 4, fontWeight: "600" },
+  statusDot: { width: 7, height: 7, borderRadius: 7, backgroundColor: colors.line, marginTop: 10 },
+  notice: { backgroundColor: "#2A2338", borderWidth: 1, borderColor: "#60469A", borderRadius: 10, padding: 15, flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 12 },
+  noticeTitle: { color: colors.surface, fontWeight: "700", fontSize: 14 },
+  noticeBody: { color: "#C2B8D5", fontSize: 12, marginTop: 3 },
+  linkBoxDark: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: colors.panel, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 12, marginBottom: 6 },
+  linkTextDark: { color: colors.surface, fontSize: 12, flex: 1 },
+  smallCopy: { width: 30, height: 30, alignItems: "center", justifyContent: "center" },
+  lightCard: { backgroundColor: colors.surface, borderRadius: 12, padding: 22, marginTop: 18 },
+  cardKicker: { color: colors.purple, fontSize: 10, fontWeight: "800", letterSpacing: 1.3 },
+  cardTitle: { color: colors.ink, fontSize: 23, fontWeight: "800", marginTop: 7 },
+  bodyDark: { color: "#625B6B", fontSize: 14, lineHeight: 21, marginTop: 10 },
+  subKicker: { color: colors.purple, fontSize: 9, fontWeight: "800", letterSpacing: 1.3, marginTop: 18 },
+  input: { borderBottomWidth: 1, borderBottomColor: "#D7D1DD", paddingVertical: 14, color: colors.ink, fontSize: 15, marginTop: 8 },
+  rowGap: { flexDirection: "row", gap: 14 },
+  outlineButton: { minHeight: 46, borderWidth: 1, borderColor: "#D0C6DA", borderRadius: 8, alignItems: "center", justifyContent: "center", marginTop: 16, flexDirection: "row", gap: 8 },
+  darkButton: { backgroundColor: colors.ink, minHeight: 52, borderRadius: 8, marginTop: 18, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 },
+  actionRow: { gap: 10 },
+  changeButton: { minHeight: 46, borderWidth: 1, borderColor: "#D0C6DA", borderRadius: 8, alignItems: "center", justifyContent: "center" },
+  changeText: { color: colors.ink, fontWeight: "700", fontSize: 14 },
+  rowBetween: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  close: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
+  paymentLine: { borderTopWidth: 1, borderBottomWidth: 1, borderColor: "#DDD7E1", marginTop: 20, paddingVertical: 14, flexDirection: "row", justifyContent: "space-between" },
+  paymentLineInner: { paddingVertical: 8, flexDirection: "row", justifyContent: "space-between" },
+  paymentLabel: { color: "#625B6B", fontSize: 13 },
+  paymentAmount: { color: colors.ink, fontWeight: "800", fontSize: 16 },
+  paymentAmountSm: { color: colors.ink, fontWeight: "700", fontSize: 14 },
+  paymentRequest: { flexDirection: "row", alignItems: "flex-start", gap: 10, marginTop: 16, borderTopWidth: 1, borderTopColor: "#DDD7E1", paddingTop: 16 },
+  paymentRequestText: { color: colors.purple, fontSize: 13, fontWeight: "700" },
+  paymentRequestSub: { color: "#8A8194", fontSize: 11, marginTop: 3, lineHeight: 15 },
+  clearedByLineDark: { color: colors.green, fontSize: 12, marginTop: 8, fontWeight: "600" },
+  emptyPanel: { backgroundColor: colors.panel, borderRadius: 12, padding: 32, alignItems: "center", marginTop: 12 },
+  emptyTitle: { color: colors.surface, fontSize: 17, fontWeight: "700", marginTop: 14 },
+  emptyBody: { color: colors.muted, fontSize: 13, textAlign: "center", marginTop: 8, lineHeight: 19, maxWidth: 320 },
+  engagementCard: { backgroundColor: colors.panel, borderRadius: 12, padding: 18, marginTop: 12, gap: 12 },
+  engagementName: { color: colors.surface, fontSize: 17, fontWeight: "700" },
+  engagementMeta: { color: colors.muted, fontSize: 12, marginTop: 4 },
+  engagementLink: { color: colors.purple, fontSize: 11, fontWeight: "600" },
+  progressBar: { height: 4, backgroundColor: colors.line, borderRadius: 2, overflow: "hidden" },
+  progressFill: { height: 4, backgroundColor: colors.purple },
+  draftList: { marginTop: 14, gap: 10 },
+  draftRow: { flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: "#EEEBF1", borderRadius: 8, padding: 12 },
+  draftIndex: { width: 26, height: 26, borderRadius: 13, backgroundColor: colors.ink, alignItems: "center", justifyContent: "center" },
+  draftIndexText: { color: colors.surface, fontSize: 10, fontWeight: "800" },
+  draftTitle: { color: colors.ink, fontSize: 14, fontWeight: "700" },
+  draftMeta: { color: "#625B6B", fontSize: 11, marginTop: 2 },
+  linkBox: { flexDirection: "row", alignItems: "center", gap: 10, borderWidth: 1, borderColor: "#D0C6DA", borderRadius: 8, paddingHorizontal: 14, paddingVertical: 14, marginTop: 16 },
+  linkText: { color: colors.ink, fontSize: 13, flex: 1, fontWeight: "600" },
+  pressed: { opacity: 0.72 },
+});
