@@ -18,7 +18,6 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 import httpx
 from io import BytesIO
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors as rl_colors
 from reportlab.lib.units import mm
@@ -409,6 +408,26 @@ async def current_user(authorization: Optional[str]):
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+# Standalone login for deployments outside Emergent's own hosting, where the
+# "Continue with Google" flow (which relies on Emergent's auth.emergentagent.com
+# and demobackend.emergentagent.com proxies) is not available. Gated by a
+# secret ACCESS_CODE env var so the agency dashboard isn't left wide open.
+@api_router.post("/auth/login")
+async def access_code_login(payload: dict):
+    code = (payload.get("code") or "").strip()
+    expected = os.environ.get("ACCESS_CODE", "")
+    if not expected or code != expected:
+        raise HTTPException(status_code=401, detail="Invalid access code")
+    email = "agency@checkpoint.local"
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    user_id = existing["user_id"] if existing else f"user_{uuid.uuid4().hex[:12]}"
+    user = {"user_id": user_id, "email": email, "name": "Agency", "picture": None}
+    await db.users.update_one({"email": email}, {"$set": user}, upsert=True)
+    token = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    await db.user_sessions.update_one({"session_token": token}, {"$set": {"session_token": token, "user_id": user_id, "created_at": now, "expires_at": now + timedelta(days=7)}}, upsert=True)
+    return {"session_token": token, "user": user}
+
 @api_router.post("/auth/session")
 async def exchange_session(payload: dict):
     session_id = payload.get("session_id")
@@ -571,9 +590,14 @@ async def resolve_change(engagement_id: str, milestone_id: str, authorization: O
     return Engagement(**clean_engagement(doc))
 
 # ---- Stripe payments ----
+# NOTE: emergentintegrations is a private package only available inside Emergent's
+# build environment, so it's imported lazily here rather than at module load time.
+# When STRIPE_API_KEY is unset (the default for this deployment), we never reach
+# the import at all, and the app boots fine without that dependency installed.
 def _stripe():
     if not STRIPE_API_KEY:
         raise HTTPException(status_code=503, detail="Payments not configured")
+    from emergentintegrations.payments.stripe.checkout import StripeCheckout
     return StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=f"{APP_BASE_URL}/api/webhook/stripe")
 
 @api_router.post("/public/engagements/{token}/milestones/{milestone_id}/pay")
@@ -585,7 +609,9 @@ async def create_milestone_payment(token: str, milestone_id: str):
     if milestone.get("payment_status") == "paid":
         raise HTTPException(status_code=409, detail="Milestone already paid")
     amount = float(milestone["fee"]) + float(milestone.get("expense") or 0)
-    session = await _stripe().create_checkout_session(CheckoutSessionRequest(
+    stripe_client = _stripe()  # raises 503 above if STRIPE_API_KEY is unset
+    from emergentintegrations.payments.stripe.checkout import CheckoutSessionRequest
+    session = await stripe_client.create_checkout_session(CheckoutSessionRequest(
         amount=amount,
         currency="usd",
         success_url=f"{APP_BASE_URL}/{token}?session_id={{CHECKOUT_SESSION_ID}}",
