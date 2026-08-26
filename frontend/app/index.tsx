@@ -9,7 +9,10 @@ import Constants from "expo-constants";
 
 WebBrowser.maybeCompleteAuthSession();
 const API = `${Constants.expoConfig?.extra?.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
-const APP_ORIGIN = process.env.EXPO_PUBLIC_BACKEND_URL || "";
+// The share link shown to agencies/clients must point at THIS web app's own
+// origin, not the API backend — fixing a bug from the original build where
+// it reused EXPO_PUBLIC_BACKEND_URL (the API host) for client-facing links.
+const APP_ORIGIN = (typeof window !== "undefined" && window.location?.origin) || process.env.EXPO_PUBLIC_BACKEND_URL || "";
 const colors = { bg: "#17151D", panel: "#221E2B", surface: "#F6F4F8", ink: "#17131D", muted: "#9A93A6", purple: "#9B6CFF", line: "#393244", green: "#55C49A", amber: "#DDAA62" };
 type ThreadMsg = { message_id: string; author: string; author_name?: string | null; body: string; created_at: string };
 type Attachment = { attachment_id: string; kind: string; name: string; url?: string | null; content_type?: string | null; created_at: string };
