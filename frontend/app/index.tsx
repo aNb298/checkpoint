@@ -56,6 +56,8 @@ export default function Index() {
   const [clearName, setClearName] = useState("");
   const [clearEmail, setClearEmail] = useState("");
   const [sessionChecked, setSessionChecked] = useState(false);
+  const [accessCode, setAccessCode] = useState("");
+  const [loginError, setLoginError] = useState("");
   const [threadMsg, setThreadMsg] = useState("");
   const [paying, setPaying] = useState(false);
   const [payBanner, setPayBanner] = useState<"" | "checking" | "paid" | "pending">("");
@@ -101,6 +103,14 @@ export default function Index() {
       const data = await r.json();
       if (r.ok) { await saveToken(data.session_token); setAuthed(true); await fetchDashboard(); setScreen("dashboard"); }
     }
+  };
+
+  const codeLogin = async () => {
+    setLoginError("");
+    const r = await fetch(`${API}/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: accessCode }) });
+    const data = await r.json();
+    if (r.ok) { await saveToken(data.session_token); setAccessCode(""); setAuthed(true); await fetchDashboard(); setScreen("dashboard"); }
+    else { setLoginError(data.detail || "Invalid access code"); }
   };
 
   const signOut = async () => { await clearToken(); setAuthed(false); setEngagements([]); setEngagement(null); setScreen("welcome"); };
@@ -412,7 +422,9 @@ export default function Index() {
       <View style={styles.logoLarge}><Ionicons name="navigate" size={27} color={colors.surface} /></View>
       <Text style={styles.display}>Work moves{Platform.OS === "web" ? " online" : " forward"}.</Text>
       <Text style={styles.lede}>Checkpoint keeps scope, approvals, and milestone payments on one clear trajectory.</Text>
-      <Pressable onPress={signIn} testID="google-signin-button" style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed]}><Ionicons name="logo-google" size={18} color={colors.surface} /><Text style={styles.primaryText}>Continue with Google</Text></Pressable>
+      <TextInput placeholder="Access code" placeholderTextColor="#9A93A6" value={accessCode} onChangeText={setAccessCode} secureTextEntry autoCapitalize="none" testID="access-code-input" style={styles.input} />
+      {loginError ? <Text style={styles.changeRequestLine}>{loginError}</Text> : null}
+      <Pressable onPress={codeLogin} testID="code-signin-button" style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed]}><Ionicons name="log-in-outline" size={18} color={colors.surface} /><Text style={styles.primaryText}>Sign in</Text></Pressable>
       <Pressable onPress={loadSample} testID="explore-sample-button" style={styles.secondaryButton}><Text style={styles.secondaryText}>Explore sample workspace</Text><Ionicons name="arrow-forward" size={17} color={colors.purple} /></Pressable>
       <Text style={styles.footnote}>For agencies and clients who value a clean record.</Text>
     </View>
