@@ -1,0 +1,44 @@
+{
+  "summary": "All 4 iteration-6 features verified end-to-end (backend + frontend @ 390x844). Backend: 16/16 new tests pass — milestone edit success + fee<=0 400 + unauth 401 + add appends + move up reorders + delete works + delete-last 409 + all 4 editing endpoints 409 after scope accept; archive sets status + client accept 409 + editing 409 + unarchive returns 'awaiting_scope_acceptance' when never accepted and 'active' when scope_accepted_at set; _mark_paid flips milestone to 'paid' and dispatches receipt email (in-process caplog verified 'Email sent ... Receipt: $...' from send_receipt_email); PDF /api/public/engagements/checkpoint-demo/summary.pdf → 200 %PDF (2755 bytes) and unknown token → 404. Regression: 34/34 previous tests (test_new_features + test_iteration5_features + test_checkpoint_api) still pass — 50/50 total green. Frontend: authed agency dashboard shows 'Show archived (1)' toggle only when archived exist, hides archived by default; opening an awaiting_scope engagement renders PDF summary + Archive buttons and EDIT CHECKPOINT panel with all six testIDs (edit-title-input, edit-fee-input, save-milestone-button, move-up-button, move-down-button, remove-milestone-button); save renamed 'Kickoff'→'Kickoff Renamed' with $650 fee and update reflected in trajectory; ADD CHECKPOINT card appended 'AddedByTest' $300; Archive button flips pill to ARCHIVED and label to Restore, dashboard hides it, toggle reveals with ARCHIVED pill, Restore returns to AWAITING SCOPE; client portal on ARCHIVED shows 'Engagement archived' read-only notice with NO edit/add/archive/accept UI; client portal on ACTIVE (checkpoint-demo) has NO agency edit/add/archive controls even after tapping a milestone; PDF fetched via /api/public/engagements/checkpoint-demo/summary.pdf returns status=200 content-type=application/pdf head=%PDF size=2755 bytes.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration6_features.py",
+    "/app/backend/tests/test_iteration5_features.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_checkpoint_api.py",
+    "/app/test_reports/pytest/iteration_6.xml",
+    "/app/test_reports/screenshots/iter6_dashboard.jpeg",
+    "/app/test_reports/screenshots/iter6_edit_section.jpeg",
+    "/app/test_reports/screenshots/iter6_edit_after.jpeg",
+    "/app/test_reports/screenshots/iter6_archived_eng.jpeg",
+    "/app/test_reports/screenshots/iter6_dashboard_toggle.jpeg",
+    "/app/test_reports/screenshots/iter6_client_archived.jpeg",
+    "/app/test_reports/screenshots/iter6_client_active.jpeg"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is 921 lines and index.tsx is 779 lines — both above the 700-line soft cap. Consider splitting server.py into routers (auth, engagements, milestones, public, payments, pdf, attachments) and extracting screens/components (Dashboard, EngagementView, EditMilestonePanel, PDF button) from index.tsx.",
+    "server.py still uses deprecated FastAPI @app.on_event('startup'/'shutdown') — migrate to lifespan handler (carried from iter 4/5).",
+    "_require_pre_scope() returns 409 for both 'active' and 'archived' with the same message 'Checkpoints can only be edited before the client accepts scope' — misleading when engagement is archived; consider branching the message based on doc['status'].",
+    "PDF endpoint /api/public/engagements/{token}/summary.pdf is unauthenticated — anyone with the share token gets the full financial breakdown including fees, expenses, and total. If share tokens are meant to be shareable-but-guessable, this may leak revenue data. Consider rate-limiting or requiring auth for archived engagements.",
+    "Receipt email is fire-and-forget via asyncio.create_task with no retry/DLQ path; if the Emergent email proxy 429s or fails, the client never receives the receipt and there's no operator visibility. Consider logging failures to a collection or using the same reminder-loop pattern as payments.",
+    "unarchive_engagement() decides new_status purely from scope_accepted_at presence — a previously 'archived from awaiting_scope_acceptance' that later has scope_accepted_at somehow set would go straight to 'active' (currently impossible but a subtle invariant to preserve)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration6_features.py",
+    "/app/test_reports/iteration_6.json",
+    "/app/test_reports/pytest/iteration_6.xml"
+  ],
+  "success_rate": {"backend": "100% (16/16 new + 34/34 regression = 50/50)", "frontend": "100% (5/5 flows: milestone edit, add, archive+dashboard toggle+restore, client-archived notice, client-active read-only)"},
+  "seed_data_creation": "Seeded users/user_sessions for user_test_01 + test-session-token (per /app/memory/test_credentials.md). Created two test engagements ('UI_Iter6_Edit', 'UI_Iter6_Archive') under user_test_01, cleaned up post-test. Also inserted/cleaned a test_rcpt_* payment_transaction for the receipt test. Sample demo engagement (checkpoint-demo) untouched.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend URL from /app/frontend/.env: EXPO_PUBLIC_BACKEND_URL=https://checkpoint-app-10.preview.emergentagent.com. Run backend suite with `python -m pytest /app/backend/tests/ -v -o addopts=` (pytest.ini enables xdist which breaks the module-scoped fixtures — force sequential). Receipt email test uses `caplog` for in-process log capture, NOT supervisor log — problem statement's '/var/log/supervisor/backend.err.log Receipt:' assertion is impossible because _mark_paid is called from the pytest process, so logger.info writes to pytest stdout instead. Emergent email proxy occasionally returns 429; treated as evidence of a real send attempt. To reset the sample demo: mongosh test_database --eval 'db.engagements.deleteMany({}); db.scope_acceptance_events.deleteMany({}); db.payment_transactions.deleteMany({});' && sudo supervisorctl restart backend. The Iteration 6 UI expects an awaiting_scope engagement under user_test_01 to exercise edit UI (canEdit=authed && status==='awaiting_scope_acceptance').",
+  "rca_of_issue": "N/A — no bugs found."
+}

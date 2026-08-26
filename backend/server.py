@@ -17,7 +17,13 @@ from html import escape
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 import httpx
+from io import BytesIO
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors as rl_colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 
 ROOT_DIR = Path(__file__).parent
@@ -211,6 +217,32 @@ async def send_thread_alert_email(agency_email: str, doc: dict, milestone: dict,
     )
     await _deliver_email(agency_email, f'Change request update · {doc.get("client_name") or "Engagement"}', _email_shell(inner))
 
+async def send_receipt_email(doc: dict, milestone: dict):
+    amount = float(milestone.get("fee") or 0) + float(milestone.get("expense") or 0)
+    paid_total = sum(float(m.get("fee") or 0) + float(m.get("expense") or 0) for m in doc.get("milestones", []) if m.get("payment_status") == "paid")
+    total = sum(float(m.get("fee") or 0) + float(m.get("expense") or 0) for m in doc.get("milestones", []))
+    paid_date = ""
+    try:
+        paid_date = datetime.fromisoformat(milestone.get("paid_at") or "").strftime("%B %d, %Y")
+    except ValueError:
+        pass
+    inner = (
+        f'<h2 style="color:#F6F4F8;font-size:22px;margin:0">Payment received — here is your receipt.</h2>'
+        f'<p style="color:#C2B8D5;font-size:14px;line-height:22px;margin:16px 0 0">We received your payment of '
+        f'<strong style="color:#F6F4F8">${amount:,.2f}</strong>{f" on {paid_date}" if paid_date else ""} for '
+        f'<strong style="color:#F6F4F8">{escape(milestone["title"])}</strong>.</p>'
+        f'<table role="presentation" width="100%" style="margin-top:18px;border-collapse:collapse">'
+        f'<tr><td style="color:#9A93A6;font-size:13px;padding:8px 0;border-bottom:1px solid #393244">Checkpoint</td>'
+        f'<td style="color:#F6F4F8;font-size:13px;text-align:right;border-bottom:1px solid #393244">{escape(milestone["title"])}</td></tr>'
+        f'<tr><td style="color:#9A93A6;font-size:13px;padding:8px 0;border-bottom:1px solid #393244">Amount paid</td>'
+        f'<td style="color:#55C49A;font-size:13px;font-weight:bold;text-align:right;border-bottom:1px solid #393244">${amount:,.2f}</td></tr>'
+        f'<tr><td style="color:#9A93A6;font-size:13px;padding:8px 0">Paid to date</td>'
+        f'<td style="color:#F6F4F8;font-size:13px;text-align:right">${paid_total:,.2f} of ${total:,.2f}</td></tr>'
+        f'</table>'
+        + _portal_button(doc["share_token"], "View your engagement")
+    )
+    await _deliver_email(doc["client_email"], f'Receipt: ${amount:,.2f} payment for {milestone["title"]}', _email_shell(inner))
+
 async def notify_agency_thread(doc: dict, milestone: dict, headline: str, note: str):
     agency = await db.users.find_one({"user_id": doc.get("agency_user_id")}, {"_id": 0})
     if agency and agency.get("email"):
@@ -282,6 +314,19 @@ class Attachment(BaseModel):
 class AttachmentLinkCreate(BaseModel):
     name: str
     url: str
+
+class MilestoneEdit(BaseModel):
+    title: Optional[str] = None
+    fee: Optional[float] = None
+    expense: Optional[float] = None
+
+class MilestoneAdd(BaseModel):
+    title: str
+    fee: float
+    expense: float = 0
+
+class MilestoneMove(BaseModel):
+    direction: str  # "up" | "down"
 
 class ThreadMessageCreate(BaseModel):
     body: str
@@ -423,6 +468,8 @@ async def public_engagement(token: str):
 @api_router.post("/public/engagements/{token}/accept", response_model=Engagement)
 async def accept_scope(token: str, payload: ScopeAcceptance):
     doc = await get_engagement(token)
+    if doc.get("status") == "archived":
+        raise HTTPException(status_code=409, detail="This engagement has been archived")
     accepted = datetime.now(timezone.utc).isoformat()
     await db.engagements.update_one({"share_token": token}, {"$set": {"scope_accepted_at": accepted, "status": "active", "client_name": payload.client_name or doc["client_name"], "client_email": payload.client_email or doc.get("client_email")}})
     await db.scope_acceptance_events.insert_one({"audit_id": f"audit_{uuid.uuid4().hex[:12]}", "engagement_id": doc["engagement_id"], "share_token": token, "client_name": payload.client_name or doc["client_name"], "client_email": payload.client_email or doc.get("client_email"), "accepted_at": accepted})
@@ -566,6 +613,10 @@ async def _mark_paid(session_id: str):
             m["payment_status"] = "paid"
             m["paid_at"] = paid_at
     await db.engagements.update_one({"engagement_id": tx["engagement_id"]}, {"$set": {"milestones": doc["milestones"]}})
+    if doc.get("client_email"):
+        paid_ms = next((m for m in doc["milestones"] if m["milestone_id"] == tx["milestone_id"]), None)
+        if paid_ms:
+            asyncio.create_task(send_receipt_email(dict(doc), dict(paid_ms)))
 
 @api_router.get("/public/payments/{session_id}/status")
 async def payment_status(session_id: str):
@@ -661,6 +712,152 @@ async def download_attachment(token: str, attachment_id: str):
                 safe_name = (a.get("name") or "file").replace('"', "")
                 return Response(content=data, media_type=ctype, headers={"Content-Disposition": f'inline; filename="{safe_name}"'})
     raise HTTPException(status_code=404, detail="Attachment not found")
+
+# ---- Milestone editing (pre-scope only) ----
+def _require_pre_scope(doc):
+    if doc.get("status") != "awaiting_scope_acceptance":
+        raise HTTPException(status_code=409, detail="Checkpoints can only be edited before the client accepts scope")
+
+@api_router.put("/engagements/{engagement_id}/milestones/{milestone_id}", response_model=Engagement)
+async def edit_milestone(engagement_id: str, milestone_id: str, payload: MilestoneEdit, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    doc = await get_agency_engagement(engagement_id, user)
+    _require_pre_scope(doc)
+    milestone = _find_milestone(doc, milestone_id)
+    if payload.title is not None:
+        if not payload.title.strip():
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        milestone["title"] = payload.title.strip()
+    if payload.fee is not None:
+        if payload.fee <= 0:
+            raise HTTPException(status_code=400, detail="Fee must be greater than zero")
+        milestone["fee"] = payload.fee
+    if payload.expense is not None:
+        if payload.expense < 0:
+            raise HTTPException(status_code=400, detail="Expense cannot be negative")
+        milestone["expense"] = payload.expense
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.post("/engagements/{engagement_id}/milestones", response_model=Engagement)
+async def add_milestone(engagement_id: str, payload: MilestoneAdd, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    if not payload.title.strip() or payload.fee <= 0:
+        raise HTTPException(status_code=400, detail="A description and a fee above zero are required")
+    doc = await get_agency_engagement(engagement_id, user)
+    _require_pre_scope(doc)
+    doc["milestones"].append(Milestone(title=payload.title.strip(), fee=payload.fee, expense=max(payload.expense, 0)).model_dump())
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.delete("/engagements/{engagement_id}/milestones/{milestone_id}", response_model=Engagement)
+async def delete_milestone(engagement_id: str, milestone_id: str, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    doc = await get_agency_engagement(engagement_id, user)
+    _require_pre_scope(doc)
+    _find_milestone(doc, milestone_id)
+    if len(doc["milestones"]) <= 1:
+        raise HTTPException(status_code=409, detail="An engagement needs at least one checkpoint")
+    doc["milestones"] = [m for m in doc["milestones"] if m["milestone_id"] != milestone_id]
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.post("/engagements/{engagement_id}/milestones/{milestone_id}/move", response_model=Engagement)
+async def move_milestone(engagement_id: str, milestone_id: str, payload: MilestoneMove, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    if payload.direction not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="direction must be 'up' or 'down'")
+    doc = await get_agency_engagement(engagement_id, user)
+    _require_pre_scope(doc)
+    _find_milestone(doc, milestone_id)
+    idx = next(i for i, m in enumerate(doc["milestones"]) if m["milestone_id"] == milestone_id)
+    if payload.direction == "up" and idx > 0:
+        doc["milestones"][idx - 1], doc["milestones"][idx] = doc["milestones"][idx], doc["milestones"][idx - 1]
+    elif payload.direction == "down" and idx < len(doc["milestones"]) - 1:
+        doc["milestones"][idx + 1], doc["milestones"][idx] = doc["milestones"][idx], doc["milestones"][idx + 1]
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"milestones": doc["milestones"]}})
+    return Engagement(**clean_engagement(doc))
+
+# ---- Archive / restore ----
+@api_router.post("/engagements/{engagement_id}/archive", response_model=Engagement)
+async def archive_engagement(engagement_id: str, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    doc = await get_agency_engagement(engagement_id, user)
+    doc["status"] = "archived"
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"status": "archived", "archived_at": datetime.now(timezone.utc).isoformat()}})
+    return Engagement(**clean_engagement(doc))
+
+@api_router.post("/engagements/{engagement_id}/unarchive", response_model=Engagement)
+async def unarchive_engagement(engagement_id: str, authorization: Optional[str] = Header(default=None)):
+    user = await current_user(authorization)
+    doc = await get_agency_engagement(engagement_id, user)
+    new_status = "active" if doc.get("scope_accepted_at") else "awaiting_scope_acceptance"
+    doc["status"] = new_status
+    await db.engagements.update_one({"engagement_id": engagement_id}, {"$set": {"status": new_status, "archived_at": None}})
+    return Engagement(**clean_engagement(doc))
+
+# ---- PDF summary ----
+def build_engagement_pdf(doc: dict) -> bytes:
+    buf = BytesIO()
+    pdf = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=18 * mm, bottomMargin=18 * mm, title="Checkpoint Engagement Summary")
+    styles = getSampleStyleSheet()
+    kicker = ParagraphStyle("kicker", parent=styles["Normal"], fontSize=8, textColor=rl_colors.HexColor("#9B6CFF"), spaceAfter=4)
+    h1 = ParagraphStyle("h1", parent=styles["Title"], fontSize=20, alignment=0, spaceAfter=2)
+    meta = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9, textColor=rl_colors.HexColor("#625B6B"))
+    cell = ParagraphStyle("cell", parent=styles["Normal"], fontSize=8, leading=10)
+
+    def fmt_date(iso):
+        if not iso:
+            return "—"
+        try:
+            return datetime.fromisoformat(iso).strftime("%b %d, %Y")
+        except ValueError:
+            return "—"
+
+    status_label = {"active": "Active", "archived": "Archived"}.get(doc.get("status"), "Awaiting scope acceptance")
+    story = [
+        Paragraph("CHECKPOINT — ENGAGEMENT SUMMARY", kicker),
+        Paragraph(escape(doc.get("client_name") or "Engagement"), h1),
+        Paragraph(f'Status: {status_label} &nbsp;·&nbsp; Created {fmt_date(doc.get("created_at"))} &nbsp;·&nbsp; Scope accepted {fmt_date(doc.get("scope_accepted_at"))}', meta),
+        Spacer(1, 14),
+    ]
+    rows = [["#", "Checkpoint", "Fee", "Expense", "Status", "Cleared", "Payment"]]
+    total_fee = total_exp = 0.0
+    for i, m in enumerate(doc.get("milestones", []), 1):
+        fee = float(m.get("fee") or 0)
+        exp = float(m.get("expense") or 0)
+        total_fee += fee
+        total_exp += exp
+        cleared = " ".join(x for x in [m.get("cleared_by_name") or "", fmt_date(m.get("cleared_at")) if m.get("cleared_at") else ""] if x) or "—"
+        payment = {"paid": f'Paid {fmt_date(m.get("paid_at"))}', "requested": "Requested"}.get(m.get("payment_status"), "—")
+        rows.append([str(i).zfill(2), Paragraph(escape(m.get("title") or ""), cell), f"${fee:,.0f}", f"${exp:,.0f}" if exp else "—", "Cleared" if m.get("status") == "cleared" else "Awaiting", Paragraph(escape(cleared), cell), payment])
+    rows.append(["", "Total", f"${total_fee:,.0f}", f"${total_exp:,.0f}" if total_exp else "—", "", "", ""])
+    table = Table(rows, colWidths=[9 * mm, 52 * mm, 18 * mm, 18 * mm, 20 * mm, 34 * mm, 25 * mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#17151D")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.HexColor("#F6F4F8")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (1, -1), (3, -1), "Helvetica-Bold"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [rl_colors.white, rl_colors.HexColor("#F3F0F7")]),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.75, rl_colors.HexColor("#9B6CFF")),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.5, rl_colors.HexColor("#9B6CFF")),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f'Generated {datetime.now(timezone.utc).strftime("%b %d, %Y")} via Checkpoint · {APP_BASE_URL}/{doc.get("share_token")}', meta))
+    pdf.build(story)
+    return buf.getvalue()
+
+@api_router.get("/public/engagements/{token}/summary.pdf")
+async def engagement_pdf(token: str):
+    doc = await get_engagement(token)
+    pdf_bytes = build_engagement_pdf(doc)
+    safe = re.sub(r"[^A-Za-z0-9 _-]", "", doc.get("client_name") or "engagement").strip().replace(" ", "-").lower() or "engagement"
+    return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="checkpoint-{safe}.pdf"'})
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):

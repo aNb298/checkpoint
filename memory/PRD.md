@@ -29,6 +29,10 @@ Checkpoint helps freelancers and small creative/service agencies manage client a
 - **Earnings Overview** — dashboard totals panel (testID `earnings-panel`): Cleared / Awaiting / Paid amounts computed client-side across all engagements.
 - **Deliverable Attachments** — agency attaches preview links or uploads files (≤15 MB, Emergent Object Storage) per milestone; clients open them from the portal via `GET /api/public/engagements/{token}/attachments/{att_id}` (files streamed through backend, links 307-redirect). `storage_path` kept in DB only, never in API responses.
 - **Thread Alerts** — agency user is emailed when a client opens a change request or replies on a thread.
+- **Milestone Editing** — pre-scope only (status `awaiting_scope_acceptance`): agency can edit title/fee/expense, reorder (move up/down), delete (min 1 kept), and add checkpoints from the engagement view. All blocked with 409 once scope accepted or archived.
+- **Client Receipts** — on payment confirmation (`_mark_paid`), client is emailed a receipt (amount, checkpoint, paid-to-date vs total).
+- **Engagement Archive** — agency can archive/restore engagements (`status: archived`, restore returns to active/awaiting based on `scope_accepted_at`). Dashboard hides archived by default with a "Show archived" toggle; earnings totals computed over visible list. Client accept blocked on archived (409); portal shows read-only archived notice.
+- **PDF Summary** — `GET /api/public/engagements/{token}/summary.pdf` (reportlab): milestones table with fees, statuses, clearances, payments + totals. "PDF summary" button in agency engagement view.
 
 ## Backend Endpoints (FastAPI, prefix `/api`)
 - `POST /auth/session` — exchange Emergent OAuth session_id → app session_token
@@ -49,6 +53,12 @@ Checkpoint helps freelancers and small creative/service agencies manage client a
 - `POST /engagements/{eng_id}/milestones/{ms_id}/attachments/upload` — agency uploads file (multipart, authed)
 - `DELETE /engagements/{eng_id}/milestones/{ms_id}/attachments/{att_id}` — agency removes attachment (authed)
 - `GET  /public/engagements/{token}/attachments/{att_id}` — client opens file (streamed) or link (redirect)
+- `PUT  /engagements/{eng_id}/milestones/{ms_id}` — edit title/fee/expense (authed, pre-scope only)
+- `POST /engagements/{eng_id}/milestones` — add checkpoint (authed, pre-scope only)
+- `DELETE /engagements/{eng_id}/milestones/{ms_id}` — remove checkpoint (authed, pre-scope, min 1)
+- `POST /engagements/{eng_id}/milestones/{ms_id}/move` — `{direction: up|down}` (authed, pre-scope)
+- `POST /engagements/{eng_id}/archive` / `POST /engagements/{eng_id}/unarchive` — authed
+- `GET  /public/engagements/{token}/summary.pdf` — PDF engagement summary
 
 ## Data Model
 `engagements`: `{engagement_id, agency_user_id, client_name, client_email?, share_token, status, scope_accepted_at?, created_at, milestones[]}`

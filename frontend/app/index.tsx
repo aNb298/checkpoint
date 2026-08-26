@@ -18,6 +18,8 @@ type Engagement = { engagement_id: string; client_name: string; client_email?: s
 type Screen = "welcome" | "dashboard" | "create" | "share" | "agency" | "client" | "accept";
 
 const money = (n: number) => `$${n.toLocaleString("en-US", { minimumFractionDigits: 0 })}`;
+const pillLabel = (s: string) => s === "active" ? "ACTIVE" : s === "archived" ? "ARCHIVED" : "AWAITING SCOPE";
+const pillDotStyle = (s: string) => s === "active" ? undefined : { backgroundColor: s === "archived" ? colors.muted : colors.amber };
 const formatDate = (iso?: string | null) => { if (!iso) return ""; try { const d = new Date(iso); return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); } catch { return ""; } };
 const getToken = async () => Platform.OS === "web" ? (globalThis as any).localStorage?.getItem("checkpoint_session") : SecureStore.getItemAsync("checkpoint_session");
 const saveToken = async (token: string) => Platform.OS === "web" ? (globalThis as any).localStorage?.setItem("checkpoint_session", token) : SecureStore.setItemAsync("checkpoint_session", token);
@@ -60,6 +62,10 @@ export default function Index() {
   const [attName, setAttName] = useState("");
   const [attUrl, setAttUrl] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [editTitle, setEditTitle] = useState("");
+  const [editFee, setEditFee] = useState("");
+  const [editExpense, setEditExpense] = useState("");
 
   // New engagement draft
   const [draftName, setDraftName] = useState("");
@@ -136,7 +142,9 @@ export default function Index() {
   })(); }, []);
 
   const cleared = useMemo(() => engagement?.milestones.filter(m => m.status === "cleared").length || 0, [engagement]);
-  const totals = useMemo(() => engagements.reduce((acc, e) => {
+  const visible = useMemo(() => showArchived ? engagements : engagements.filter(e => e.status !== "archived"), [engagements, showArchived]);
+  const archivedCount = useMemo(() => engagements.filter(e => e.status === "archived").length, [engagements]);
+  const totals = useMemo(() => visible.reduce((acc, e) => {
     e.milestones.forEach(m => {
       const amt = m.fee + (m.expense || 0);
       if (m.status === "cleared") acc.cleared += amt;
@@ -144,7 +152,7 @@ export default function Index() {
       if (m.payment_status === "paid") acc.paid += amt;
     });
     return acc;
-  }, { cleared: 0, invoiced: 0, paid: 0 }), [engagements]);
+  }, { cleared: 0, invoiced: 0, paid: 0 }), [visible]);
 
   const accept = async () => {
     if (!engagement) return;
@@ -292,6 +300,73 @@ export default function Index() {
     else await WebBrowser.openBrowserAsync(url);
   };
 
+  const openMilestone = (m: Milestone) => {
+    setActive(m);
+    setEditTitle(m.title);
+    setEditFee(String(m.fee));
+    setEditExpense(m.expense ? String(m.expense) : "");
+  };
+
+  const saveMilestoneEdit = async (m: Milestone) => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    const fee = parseFloat(editFee || "0");
+    if (!editTitle.trim() || isNaN(fee) || fee <= 0) { Alert.alert("Missing details", "A description and a fee above zero are required."); return; }
+    setLoading(true);
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` }, body: JSON.stringify({ title: editTitle.trim(), fee, expense: parseFloat(editExpense || "0") || 0 }) });
+    if (r.ok) { syncEngagement(await r.json(), m.milestone_id); fetchDashboard(); }
+    else { const d = await r.json().catch(() => ({})); Alert.alert("Could not save", d.detail || "Please try again."); }
+    setLoading(false);
+  };
+
+  const moveMilestone = async (m: Milestone, direction: "up" | "down") => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}/move`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` }, body: JSON.stringify({ direction }) });
+    if (r.ok) { syncEngagement(await r.json(), m.milestone_id); fetchDashboard(); }
+  };
+
+  const removeMilestone = async (m: Milestone) => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones/${m.milestone_id}`, { method: "DELETE", headers: { Authorization: `Bearer ${t}` } });
+    if (r.ok) { setEngagement(await r.json()); setActive(null); fetchDashboard(); }
+    else { const d = await r.json().catch(() => ({})); Alert.alert("Could not remove", d.detail || "Please try again."); }
+  };
+
+  const addMilestoneToEngagement = async () => {
+    if (!engagement) return;
+    const fee = parseFloat(msFee || "0");
+    if (!msTitle.trim() || isNaN(fee) || fee <= 0) { Alert.alert("Missing details", "Every checkpoint needs a description and a fee."); return; }
+    const t = await getToken();
+    if (!t) return;
+    setLoading(true);
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/milestones`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` }, body: JSON.stringify({ title: msTitle.trim(), fee, expense: parseFloat(msExpense || "0") || 0 }) });
+    if (r.ok) { setEngagement(await r.json()); setMsTitle(""); setMsFee(""); setMsExpense(""); fetchDashboard(); }
+    setLoading(false);
+  };
+
+  const toggleArchive = async () => {
+    if (!engagement) return;
+    const t = await getToken();
+    if (!t) return;
+    setLoading(true);
+    const action = engagement.status === "archived" ? "unarchive" : "archive";
+    const r = await fetch(`${API}/engagements/${engagement.engagement_id}/${action}`, { method: "POST", headers: { Authorization: `Bearer ${t}` } });
+    if (r.ok) { setEngagement(await r.json()); fetchDashboard(); }
+    setLoading(false);
+  };
+
+  const downloadPdf = async () => {
+    if (!engagement) return;
+    const url = `${API}/public/engagements/${engagement.share_token}/summary.pdf`;
+    if (Platform.OS === "web") window.open(url, "_blank");
+    else await WebBrowser.openBrowserAsync(url);
+  };
+
   const addDraftMilestone = () => {
     const fee = parseFloat(msFee || "0");
     if (!msTitle.trim() || isNaN(fee) || fee <= 0) { Alert.alert("Missing details", "Every checkpoint needs a description and a fee."); return; }
@@ -347,21 +422,22 @@ export default function Index() {
     <Header eyebrow="AGENCY CONTROL" title="Engagements" right={<Pressable onPress={signOut} testID="sign-out-button" style={styles.textButton}><Text style={styles.textButtonLabel}>Sign out</Text></Pressable>} />
     <ScrollView contentContainerStyle={styles.content}>
       <View style={styles.dashboardTop}>
-        <View><Text style={styles.sectionLabel}>ACTIVE ENGAGEMENTS</Text><Text style={styles.bigStat}>{engagements.length} <Text style={styles.bigStatMuted}>total</Text></Text></View>
+        <View><Text style={styles.sectionLabel}>ACTIVE ENGAGEMENTS</Text><Text style={styles.bigStat}>{visible.length} <Text style={styles.bigStatMuted}>total</Text></Text></View>
         <Pressable onPress={() => setScreen("create")} testID="new-engagement-button" style={styles.newButton}><Ionicons name="add" size={18} color={colors.surface} /><Text style={styles.primaryText}>New engagement</Text></Pressable>
       </View>
-      {engagements.length > 0 && <View style={styles.earningsPanel} testID="earnings-panel">
+      {visible.length > 0 && <View style={styles.earningsPanel} testID="earnings-panel">
         <View style={styles.earningsCol}><Text style={styles.earningsLabel}>CLEARED</Text><Text style={styles.earningsValue}>{money(totals.cleared)}</Text></View>
         <View style={styles.earningsDivider} />
         <View style={styles.earningsCol}><Text style={styles.earningsLabel}>AWAITING</Text><Text style={[styles.earningsValue, { color: colors.amber }]}>{money(totals.invoiced)}</Text></View>
         <View style={styles.earningsDivider} />
         <View style={styles.earningsCol}><Text style={styles.earningsLabel}>PAID</Text><Text style={[styles.earningsValue, { color: colors.green }]}>{money(totals.paid)}</Text></View>
       </View>}
-      {engagements.length === 0 ? <View style={styles.emptyPanel}>
+      {archivedCount > 0 && <Pressable onPress={() => setShowArchived(v => !v)} testID="toggle-archived-button" style={styles.archiveToggle}><Ionicons name="archive-outline" size={14} color={colors.muted} /><Text style={styles.archiveToggleText}>{showArchived ? "Hide archived" : `Show archived (${archivedCount})`}</Text></Pressable>}
+      {visible.length === 0 ? <View style={styles.emptyPanel}>
         <Ionicons name="navigate-outline" size={28} color={colors.muted} />
         <Text style={styles.emptyTitle}>No engagements yet</Text>
         <Text style={styles.emptyBody}>Start a new engagement to define the trajectory and share the plan with your client.</Text>
-      </View> : engagements.map(e => {
+      </View> : visible.map(e => {
         const clearedCount = e.milestones.filter(m => m.status === "cleared").length;
         const paidCount = e.milestones.filter(m => m.payment_status === "paid").length;
         const requestedCount = e.milestones.filter(m => m.payment_status === "requested").length;
@@ -372,7 +448,7 @@ export default function Index() {
               <Text style={styles.engagementName}>{e.client_name}</Text>
               <Text style={styles.engagementMeta}>{clearedCount} of {e.milestones.length} milestones cleared</Text>
             </View>
-            <View style={styles.statusPill}><View style={[styles.pillDot, e.status !== "active" && { backgroundColor: colors.amber }]} /><Text style={styles.pillText}>{e.status === "active" ? "ACTIVE" : "AWAITING SCOPE"}</Text></View>
+            <View style={styles.statusPill}><View style={[styles.pillDot, pillDotStyle(e.status)]} /><Text style={styles.pillText}>{pillLabel(e.status)}</Text></View>
           </View>
           <View style={styles.progressBar}><View style={[styles.progressFill, { width: `${(clearedCount / e.milestones.length) * 100}%` }]} /></View>
           <View style={styles.rowBetween}>
@@ -462,6 +538,7 @@ export default function Index() {
 
   const isClient = screen === "client";
   const backTo = isClient ? undefined : (authed ? () => setScreen("dashboard") : () => setScreen("welcome"));
+  const canEdit = !isClient && authed && engagement.status === "awaiting_scope_acceptance";
 
   return <SafeAreaView style={styles.app}>
     <Header onBack={backTo} eyebrow={isClient ? "CLIENT PORTAL" : "AGENCY CONTROL"} title={engagement.client_name} />
@@ -469,16 +546,30 @@ export default function Index() {
     <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <View style={styles.topline}>
         <View><Text style={styles.sectionLabel}>{isClient ? "ENGAGEMENT STATUS" : "ACTIVE ENGAGEMENT"}</Text><Text style={styles.bigStat}>{cleared} <Text style={styles.bigStatMuted}>/ {engagement.milestones.length}</Text></Text><Text style={styles.statCaption}>checkpoints cleared</Text></View>
-        <View style={styles.statusPill}><View style={[styles.pillDot, engagement.status !== "active" && { backgroundColor: colors.amber }]} /><Text style={styles.pillText}>{engagement.status === "active" ? "ACTIVE" : "AWAITING SCOPE"}</Text></View>
+        <View style={styles.statusPill}><View style={[styles.pillDot, pillDotStyle(engagement.status)]} /><Text style={styles.pillText}>{pillLabel(engagement.status)}</Text></View>
       </View>
       {payBanner !== "" && <View style={[styles.payBanner, payBanner === "paid" && styles.payBannerPaid]}>
         {payBanner === "checking" ? <ActivityIndicator size="small" color={colors.purple} /> : <Ionicons name={payBanner === "paid" ? "checkmark-circle" : "time-outline"} size={18} color={payBanner === "paid" ? colors.green : colors.amber} />}
         <Text style={styles.payBannerText} testID="payment-banner-text">{payBanner === "checking" ? "Confirming your payment with Stripe…" : payBanner === "paid" ? "Payment received — thank you!" : "Payment not confirmed yet — it can take a moment. Check back shortly."}</Text>
       </View>}
-      {isClient && engagement.status !== "active" && <Pressable onPress={() => setScreen("accept")} testID="open-accept-button" style={styles.notice}><Ionicons name="lock-open-outline" size={19} color={colors.purple} /><View style={{ flex: 1 }}><Text style={styles.noticeTitle}>Scope acceptance required</Text><Text style={styles.noticeBody}>Accept the plan before the first milestone can move.</Text></View><Ionicons name="chevron-forward" size={18} color={colors.purple} /></Pressable>}
+      {isClient && engagement.status === "awaiting_scope_acceptance" && <Pressable onPress={() => setScreen("accept")} testID="open-accept-button" style={styles.notice}><Ionicons name="lock-open-outline" size={19} color={colors.purple} /><View style={{ flex: 1 }}><Text style={styles.noticeTitle}>Scope acceptance required</Text><Text style={styles.noticeBody}>Accept the plan before the first milestone can move.</Text></View><Ionicons name="chevron-forward" size={18} color={colors.purple} /></Pressable>}
+      {isClient && engagement.status === "archived" && <View style={styles.notice}><Ionicons name="archive-outline" size={19} color={colors.muted} /><View style={{ flex: 1 }}><Text style={styles.noticeTitle}>Engagement archived</Text><Text style={styles.noticeBody}>This engagement has been closed by the agency. The record below is read-only.</Text></View></View>}
       {!isClient && <View style={styles.linkBoxDark}><Ionicons name="link-outline" size={16} color={colors.purple} /><Text style={styles.linkTextDark} numberOfLines={1} testID="agency-share-link">{shareUrl}</Text><Pressable onPress={copyShareLink} testID="agency-copy-link" style={styles.smallCopy}><Ionicons name="copy-outline" size={15} color={colors.purple} /></Pressable></View>}
+      {!isClient && <View style={styles.toolRow}>
+        <Pressable onPress={downloadPdf} testID="download-pdf-button" style={styles.toolButton}><Ionicons name="document-text-outline" size={15} color={colors.purple} /><Text style={styles.toolButtonText}>PDF summary</Text></Pressable>
+        {authed && <Pressable onPress={toggleArchive} disabled={loading} testID="archive-button" style={styles.toolButton}><Ionicons name={engagement.status === "archived" ? "arrow-undo-outline" : "archive-outline"} size={15} color={colors.purple} /><Text style={styles.toolButtonText}>{engagement.status === "archived" ? "Restore" : "Archive"}</Text></Pressable>}
+      </View>}
       <View style={styles.sectionHead}><Text style={styles.sectionTitle}>Trajectory</Text><Text style={styles.sectionHint}>{isClient ? "Tap a checkpoint to review" : "Shared with client"}</Text></View>
-      <View style={styles.pathCard}><Path milestones={engagement.milestones} onSelect={setActive} showClearedBy /></View>
+      <View style={styles.pathCard}><Path milestones={engagement.milestones} onSelect={openMilestone} showClearedBy /></View>
+      {canEdit && <View style={styles.lightCard}>
+        <Text style={styles.cardKicker}>ADD CHECKPOINT</Text>
+        <TextInput placeholder="Checkpoint description" placeholderTextColor="#9A93A6" value={msTitle} onChangeText={setMsTitle} testID="agency-add-title-input" style={styles.input} />
+        <View style={styles.rowGap}>
+          <TextInput placeholder="Fee (USD)" placeholderTextColor="#9A93A6" value={msFee} onChangeText={setMsFee} keyboardType="decimal-pad" testID="agency-add-fee-input" style={[styles.input, { flex: 1 }]} />
+          <TextInput placeholder="Expense (optional)" placeholderTextColor="#9A93A6" value={msExpense} onChangeText={setMsExpense} keyboardType="decimal-pad" testID="agency-add-expense-input" style={[styles.input, { flex: 1 }]} />
+        </View>
+        <Pressable onPress={addMilestoneToEngagement} disabled={loading} testID="agency-add-milestone-button" style={styles.outlineButton}><Ionicons name="add" size={17} color={colors.ink} /><Text style={styles.changeText}>Add checkpoint</Text></Pressable>
+      </View>}
       {active && <View style={styles.lightCard}>
         <View style={styles.rowBetween}>
           <View><Text style={styles.cardKicker}>CHECKPOINT {engagement.milestones.indexOf(active) + 1}</Text><Text style={styles.cardTitle}>{active.title}</Text></View>
@@ -488,6 +579,20 @@ export default function Index() {
         {active.status === "cleared" && active.cleared_by_name ? <Text style={styles.clearedByLineDark}>Cleared by {active.cleared_by_name}{active.cleared_at ? `, ${formatDate(active.cleared_at)}` : ""}</Text> : null}
         <View style={styles.paymentLine}><Text style={styles.paymentLabel}>Milestone fee</Text><Text style={styles.paymentAmount}>{money(active.fee)}</Text></View>
         {active.expense > 0 && <View style={styles.paymentLineInner}><Text style={styles.paymentLabel}>Expense</Text><Text style={styles.paymentAmountSm}>{money(active.expense)}</Text></View>}
+        {canEdit && <View style={styles.attachBox}>
+          <Text style={[styles.subKicker, { marginTop: 0 }]}>EDIT CHECKPOINT</Text>
+          <TextInput placeholder="Checkpoint description" placeholderTextColor="#9A93A6" value={editTitle} onChangeText={setEditTitle} testID="edit-title-input" style={styles.input} />
+          <View style={styles.rowGap}>
+            <TextInput placeholder="Fee (USD)" placeholderTextColor="#9A93A6" value={editFee} onChangeText={setEditFee} keyboardType="decimal-pad" testID="edit-fee-input" style={[styles.input, { flex: 1 }]} />
+            <TextInput placeholder="Expense" placeholderTextColor="#9A93A6" value={editExpense} onChangeText={setEditExpense} keyboardType="decimal-pad" testID="edit-expense-input" style={[styles.input, { flex: 1 }]} />
+          </View>
+          <View style={[styles.rowGap, { marginTop: 14 }]}>
+            <Pressable onPress={() => saveMilestoneEdit(active)} disabled={loading} testID="save-milestone-button" style={[styles.changeButton, { flex: 1 }]}>{loading ? <ActivityIndicator color={colors.ink} /> : <Text style={styles.changeText}>Save changes</Text>}</Pressable>
+            <Pressable onPress={() => moveMilestone(active, "up")} testID="move-up-button" style={styles.iconAction}><Ionicons name="arrow-up" size={17} color={colors.ink} /></Pressable>
+            <Pressable onPress={() => moveMilestone(active, "down")} testID="move-down-button" style={styles.iconAction}><Ionicons name="arrow-down" size={17} color={colors.ink} /></Pressable>
+            <Pressable onPress={() => removeMilestone(active)} testID="remove-milestone-button" style={styles.iconAction}><Ionicons name="trash-outline" size={17} color="#B0503C" /></Pressable>
+          </View>
+        </View>}
         {(((active.attachments?.length || 0) > 0) || !isClient) && <View style={styles.attachBox}>
           <Text style={[styles.subKicker, { marginTop: 0 }]}>DELIVERABLES</Text>
           {(active.attachments || []).map(a => <View key={a.attachment_id} style={styles.attachRow}>
@@ -647,6 +752,12 @@ const styles = StyleSheet.create({
   attachRow: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#EEEBF1", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, marginTop: 10 },
   attachName: { color: colors.purple, fontSize: 13, fontWeight: "700" },
   attachEmpty: { color: "#8A8194", fontSize: 12, marginTop: 10, lineHeight: 17 },
+  toolRow: { flexDirection: "row", gap: 10, marginBottom: 8 },
+  toolButton: { flexDirection: "row", alignItems: "center", gap: 7, borderWidth: 1, borderColor: colors.line, borderRadius: 8, paddingHorizontal: 14, minHeight: 40, justifyContent: "center" },
+  toolButtonText: { color: colors.surface, fontSize: 12, fontWeight: "700" },
+  archiveToggle: { flexDirection: "row", alignItems: "center", gap: 7, alignSelf: "flex-start", paddingVertical: 10, paddingHorizontal: 4, marginTop: 2 },
+  archiveToggleText: { color: colors.muted, fontSize: 12, fontWeight: "700" },
+  iconAction: { width: 46, minHeight: 46, borderWidth: 1, borderColor: "#D0C6DA", borderRadius: 8, alignItems: "center", justifyContent: "center" },
   emptyPanel: { backgroundColor: colors.panel, borderRadius: 12, padding: 32, alignItems: "center", marginTop: 12 },
   emptyTitle: { color: colors.surface, fontSize: 17, fontWeight: "700", marginTop: 14 },
   emptyBody: { color: colors.muted, fontSize: 13, textAlign: "center", marginTop: 8, lineHeight: 19, maxWidth: 320 },
